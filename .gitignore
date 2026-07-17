@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local dev tooling
+.agents/
+.claude/
+skills-lock.json
+
+# Cargo profiles
+*.profile
