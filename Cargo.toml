@@ -1,0 +1,22 @@
+[package]
+name = "ping_monitor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "MIT"
+authors = ["Claudio Ignacio Sanchez Montoya"]
+description = "Terminal network monitor with multi-target consensus, adaptive baseline, and chimes on connection state transitions"
+repository = "https://github.com/clasanch/ping_monitor"
+keywords = ["network", "monitoring", "tui", "ping", "ratatui"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "signal"] }
+ratatui = { version = "0.29", features = ["crossterm"] }
+crossterm = "0.28"
+rodio = { version = "0.20", default-features = false, features = ["flac", "vorbis"] }
+hickory-resolver = "0.24"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
