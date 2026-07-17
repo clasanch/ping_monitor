@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "signal"] }
 ratatui = { version = "0.29", features = ["crossterm"] }
-crossterm = "0.28"
+crossterm = "0.29"
 rodio = { version = "0.20", default-features = false, features = ["flac", "vorbis"] }
 hickory-resolver = "0.24"
 
