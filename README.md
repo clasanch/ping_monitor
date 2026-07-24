@@ -18,7 +18,7 @@ Other monitors alert through the network. An outage notifier that needs the netw
 - **Adaptive baseline** — learns p90 latency and jitter from the last 5 minutes. Thresholds scale to *your* link, not hardcoded numbers.
 - **DNS matrix** — 3 resolvers × 3 domains (differential diagnosis). Tells apart "this site is down" from "DNS is broken" from "my resolver is unreachable".
 - **Insights panel** — probable-cause diagnosis from live metrics (router vs ISP vs Wi-Fi vs DNS vs the remote site), ranked with evidence and a suggested action. Always on, right under the header.
-- **Gateway auto-detection** — default route discovered on macOS/Linux/Windows and probed as extra `[gw]`. A refused connection counts as alive (a TCP RST proves the router is up), feeding the router-vs-ISP insight with zero configuration.
+- **Gateway auto-detection** — default route discovered on macOS/Linux/Windows and probed as extra `[gw]`. A refused connection counts as alive (a TCP RST proves the router is up), feeding the router-vs-ISP insight with zero configuration. Re-detected every 15s: roam to another network or start a VPN and the probe follows the new gateway live, logging the change.
 - **Asymmetric hysteresis** — bad streak of 3 to trip; good streak of 8 to recover. Anti-flap with a 15s dwell.
 - **Session summaries** — uptime %, MTTR, outages/recoveries counters, top-3 latency and jitter spikes with unix timestamps. Auto-exported as TSV on every state transition.
 - **Hardware-accurate audio** — pitched chimes generated via `rodio` synth (E6 shimmer for degraded, ADSR chord for down/recover), fading on transitions only. Mute with `m` cuts everything.
@@ -57,7 +57,7 @@ PM_REMINDER_S=30
 
 Internals clamp everything to safe ranges on startup; you can't break it with bad env values.
 
-`PM_EXTRAS` is optional for gateway monitoring: the default gateway is auto-detected at startup and probed as extra `[gw]`. Auto-detection is skipped if you already list the gateway IP yourself.
+`PM_EXTRAS` is optional for gateway monitoring: the default gateway is auto-detected at startup and probed as extra `[gw]`, with re-detection every 15s so network/roaming changes are followed live. Auto-detection (and re-detection) is skipped if you already list the gateway IP yourself.
 
 ## Layout
 
@@ -77,7 +77,7 @@ Internals clamp everything to safe ranges on startup; you can't break it with ba
 cargo test
 ```
 
-57 tests covering config validation, hysteresis, pooled stats, baseline percentile, session accrual, ticks, gateway parsers, refused-as-alive semantics, and every insight rule (pattern match, priority order, top-3 cap).
+60 tests covering config validation, hysteresis, pooled stats, baseline percentile, session accrual, ticks, gateway parsers, gateway update/redetection semantics, refused-as-alive, and every insight rule (pattern match, priority order, top-3 cap).
 
 ## Screenshots
 
