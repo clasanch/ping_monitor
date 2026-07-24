@@ -1,4 +1,5 @@
 mod app;
+mod gateway;
 mod insight;
 mod net;
 mod sound;
@@ -186,6 +187,32 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    // Auto-detect the default gateway and probe it as extra [gw]; feeds the
+    // router-vs-ISP insight without requiring PM_EXTRAS configuration.
+    let mut auto_gw_idx: Option<usize> = None;
+    if let Some(gw) = gateway::default_gateway() {
+        let monitored =
+            app.extras.iter().any(|e| e.host == gw) || primaries.iter().any(|(_, h, _)| h == &gw);
+        if !monitored {
+            auto_gw_idx = Some(app.extras.len());
+            app.extras.push(app::ExtraProbe {
+                label: "gw".into(),
+                host: gw.clone(),
+                port: 80,
+                last: None,
+                state: app::LinkState::Up,
+                total: 0,
+                lost: 0,
+                consec_loss: 0,
+                ring: app::Ring::new(30),
+            });
+            app.log(
+                app::Level::Info,
+                format!("gateway auto-detected: {} (extra [gw])", gw),
+            );
+        }
+    }
+
     app.log(
         app::Level::Info,
         format!("primary targets: {}", primaries.len()),
@@ -232,6 +259,7 @@ async fn main() -> std::io::Result<()> {
             addr: host.clone(),
             port: *port,
             timeout_ms: app.cfg.timeout_ms,
+            alive_on_refused: false,
         };
         let stagger_ms = (idx as u64) * 200;
         let interval_handle = Arc::clone(&ping_interval_handle);
@@ -300,6 +328,8 @@ async fn main() -> std::io::Result<()> {
             addr: ex.host.clone(),
             port: ex.port,
             timeout_ms: app.cfg.timeout_ms,
+            // the auto-gateway cares about host aliveness, not port 80
+            alive_on_refused: Some(i) == auto_gw_idx,
         };
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
