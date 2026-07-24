@@ -1,4 +1,5 @@
 use crate::app::{App, HistBucket, Level, LinkState, EVENTS_CAP};
+use crate::insight::{diagnose, Insight};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::Marker;
@@ -83,7 +84,14 @@ pub fn draw(f: &mut Frame, app: &App) {
     let show_extras = !app.extras.is_empty() && size.height >= 30;
     let show_stats = size.height >= 26;
 
-    let mut constraints = vec![Constraint::Length(3), Constraint::Length(9)];
+    let insights = diagnose(app);
+    let insight_h = insights.len().clamp(1, 3) as u16 + 2;
+
+    let mut constraints = vec![
+        Constraint::Length(3),
+        Constraint::Length(insight_h),
+        Constraint::Length(9),
+    ];
     if show_targets {
         let rows = app.primaries.len() as u16 + 4;
         constraints.push(Constraint::Length(rows));
@@ -111,6 +119,8 @@ pub fn draw(f: &mut Frame, app: &App) {
 
     let mut idx = 0;
     draw_header(f, app, main[idx]);
+    idx += 1;
+    draw_insights(f, &insights, main[idx]);
     idx += 1;
     draw_latency(f, app, main[idx]);
     idx += 1;
@@ -191,6 +201,48 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ));
     f.render_widget(gauge, h[1]);
+}
+
+fn draw_insights(f: &mut Frame, insights: &[Insight], area: Rect) {
+    let items: Vec<Line> = insights
+        .iter()
+        .take(3)
+        .map(|i| {
+            let (icon, col) = match i.severity {
+                Level::Bad => ("✗", BAD),
+                Level::Warn => ("⚠", WARN),
+                Level::Info => ("ℹ", ACCENT),
+                Level::Good => ("✓", OK),
+            };
+            let mut spans = vec![
+                Span::styled(
+                    format!(" {} ", icon),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    i.cause.clone(),
+                    Style::default().fg(col).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !i.evidence.is_empty() {
+                spans.push(Span::styled(
+                    format!("  ·  {}", i.evidence),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            if !i.action.is_empty() {
+                spans.push(Span::styled(
+                    format!("  →  {}", i.action),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(items).block(header_block("Insights · probable cause → action")),
+        area,
+    );
 }
 
 fn draw_latency(f: &mut Frame, app: &App, area: Rect) {

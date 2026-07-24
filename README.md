@@ -17,6 +17,7 @@ Other monitors alert through the network. An outage notifier that needs the netw
 - **Multi-target consensus** — pings 3 primaries (Cloudflare/Google/Quad9), majority vote decides link state. Loss on one target ≠ outage.
 - **Adaptive baseline** — learns p90 latency and jitter from the last 5 minutes. Thresholds scale to *your* link, not hardcoded numbers.
 - **DNS matrix** — 3 resolvers × 3 domains (differential diagnosis). Tells apart "this site is down" from "DNS is broken" from "my resolver is unreachable".
+- **Insights panel** — probable-cause diagnosis from live metrics (router vs ISP vs Wi-Fi vs DNS vs the remote site), ranked with evidence and a suggested action. Always on, right under the header.
 - **Asymmetric hysteresis** — bad streak of 3 to trip; good streak of 8 to recover. Anti-flap with a 15s dwell.
 - **Session summaries** — uptime %, MTTR, outages/recoveries counters, top-3 latency and jitter spikes with unix timestamps. Auto-exported as TSV on every state transition.
 - **Hardware-accurate audio** — pitched chimes generated via `rodio` synth (E6 shimmer for degraded, ADSR chord for down/recover), fading on transitions only. Mute with `m` cuts everything.
@@ -59,6 +60,7 @@ Internals clamp everything to safe ranges on startup; you can't break it with ba
 
 ```
 ┌ ping_monitor [cf:1.1.1.1:443, gg:8.8.8.8:443, q9:9.9.9.9:443] dns 3×3 remind 30s ● Online ┐ Quality Score
+├ Insights  probable cause · evidence → suggested action (top 3, always on)                 │
 ├ Latency                                  │ Jitter                                            │
 │ pooled, median-of-3, warn reference line  │ pooled, same treatment                            │
 ├ Targets cf ● gg ● q9 ● / Extras / Loss   │ Streaks: uptime%, MTTR, top-3 spikes              │
@@ -72,7 +74,7 @@ Internals clamp everything to safe ranges on startup; you can't break it with ba
 cargo test
 ```
 
-20 tests covering config validation, hysteresis, pooled stats, baseline percentile, session accrual, ticks.
+49 tests covering config validation, hysteresis, pooled stats, baseline percentile, session accrual, ticks, and every insight rule (pattern match, priority order, top-3 cap).
 
 ## Screenshots
 

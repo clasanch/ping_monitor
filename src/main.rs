@@ -1,4 +1,5 @@
 mod app;
+mod insight;
 mod net;
 mod sound;
 mod ui;
