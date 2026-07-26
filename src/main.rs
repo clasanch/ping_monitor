@@ -1,4 +1,6 @@
 mod app;
+mod gateway;
+mod insight;
 mod net;
 mod sound;
 mod ui;
@@ -20,6 +22,7 @@ enum AppMsg {
     TraceLine(String),
     TraceDone,
     WifiRssi(Option<i16>),
+    GatewayNew(String),
     Quit,
 }
 
@@ -185,6 +188,68 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
+    // Auto-detect the default gateway and probe it as extra [gw]; feeds the
+    // router-vs-ISP insight without requiring PM_EXTRAS configuration.
+    // A re-detection task keeps the probe following network/roaming changes.
+    let gw_now = gateway::default_gateway();
+    if let Some(ref gw) = gw_now {
+        let monitored =
+            app.extras.iter().any(|e| e.host == *gw) || primaries.iter().any(|(_, h, _)| h == gw);
+        if !monitored {
+            app.auto_gw_idx = Some(app.extras.len());
+            app.extras.push(app::ExtraProbe {
+                label: "gw".into(),
+                host: gw.clone(),
+                port: 80,
+                last: None,
+                state: app::LinkState::Up,
+                total: 0,
+                lost: 0,
+                consec_loss: 0,
+                ring: app::Ring::new(30),
+            });
+            app.log(
+                app::Level::Info,
+                format!("gateway auto-detected: {} (extra [gw])", gw),
+            );
+        }
+    }
+    if let Ok(mut cur) = app.gw_shared.lock() {
+        *cur = gw_now.clone().unwrap_or_default();
+    }
+
+    // Re-detect the default route periodically: roaming to another network
+    // (or a VPN taking over) changes the gateway, and [gw] must follow.
+    // Skipped when the user monitors the gateway IP manually — their probe,
+    // their semantics.
+    let user_monitors_gw = gw_now.is_some() && app.auto_gw_idx.is_none();
+    if !user_monitors_gw {
+        let tx = tx.clone();
+        let shared = Arc::clone(&app.gw_shared);
+        tokio::spawn(async move {
+            let mut tick = interval(Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                let new = tokio::task::spawn_blocking(gateway::default_gateway)
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(gw) = new {
+                    let changed = match shared.lock() {
+                        Ok(mut cur) if *cur != gw => {
+                            *cur = gw.clone();
+                            true
+                        }
+                        _ => false,
+                    };
+                    if changed {
+                        let _ = tx.send(AppMsg::GatewayNew(gw));
+                    }
+                }
+            }
+        });
+    }
+
     app.log(
         app::Level::Info,
         format!("primary targets: {}", primaries.len()),
@@ -231,6 +296,7 @@ async fn main() -> std::io::Result<()> {
             addr: host.clone(),
             port: *port,
             timeout_ms: app.cfg.timeout_ms,
+            alive_on_refused: false,
         };
         let stagger_ms = (idx as u64) * 200;
         let interval_handle = Arc::clone(&ping_interval_handle);
@@ -294,11 +360,15 @@ async fn main() -> std::io::Result<()> {
     }
 
     for (i, ex) in app.extras.iter().enumerate() {
+        if Some(i) == app.auto_gw_idx {
+            continue; // the auto-gateway pinger below follows re-detection
+        }
         let tx = tx.clone();
         let pinger = net::TcpPinger {
             addr: ex.host.clone(),
             port: ex.port,
             timeout_ms: app.cfg.timeout_ms,
+            alive_on_refused: false,
         };
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
@@ -309,6 +379,15 @@ async fn main() -> std::io::Result<()> {
                 let _ = tx.send(AppMsg::ExtraPing(i, s));
             }
         });
+    }
+
+    if let Some(idx) = app.auto_gw_idx {
+        spawn_gateway_pinger(
+            idx,
+            Arc::clone(&app.gw_shared),
+            app.cfg.timeout_ms,
+            tx.clone(),
+        );
     }
 
     let mut terminal = ratatui::init();
@@ -354,6 +433,30 @@ async fn run(
                 AppMsg::TraceLine(line) => app.log(app::Level::Info, line),
                 AppMsg::TraceDone => app.log(app::Level::Info, "traceroute finished"),
                 AppMsg::WifiRssi(v) => app.set_wifi_rssi(v),
+                AppMsg::GatewayNew(gw) => match app.apply_gateway_update(&gw) {
+                    app::GatewayUpdate::Unchanged => {}
+                    app::GatewayUpdate::Updated { old, new } => {
+                        app.log(
+                            app::Level::Info,
+                            format!(
+                                "gateway changed: {} → {} (network/roaming switch)",
+                                old, new
+                            ),
+                        );
+                    }
+                    app::GatewayUpdate::Added { idx } => {
+                        app.log(
+                            app::Level::Info,
+                            format!("gateway detected: {} (extra [gw])", gw),
+                        );
+                        spawn_gateway_pinger(
+                            idx,
+                            Arc::clone(&app.gw_shared),
+                            app.cfg.timeout_ms,
+                            tx.clone(),
+                        );
+                    }
+                },
                 AppMsg::Quit => return Ok(()),
             }
         }
@@ -456,6 +559,34 @@ fn emit(
     if let (Some(a), Some(e)) = (audio, ev) {
         let _ = a.send(e);
     }
+}
+
+/// Probe the auto-gateway on a 5s cadence, reading the address from the
+/// shared handle so re-detection retargets the probe without a respawn.
+fn spawn_gateway_pinger(
+    idx: usize,
+    shared: Arc<std::sync::Mutex<String>>,
+    timeout_ms: u64,
+    tx: mpsc::UnboundedSender<AppMsg>,
+) {
+    tokio::spawn(async move {
+        let mut tick = interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            let addr = shared.lock().map(|g| g.clone()).unwrap_or_default();
+            if addr.is_empty() {
+                continue;
+            }
+            let pinger = net::TcpPinger {
+                addr,
+                port: 80,
+                timeout_ms,
+                alive_on_refused: true,
+            };
+            let s = pinger.ping().await;
+            let _ = tx.send(AppMsg::ExtraPing(idx, s));
+        }
+    });
 }
 
 #[cfg(test)]

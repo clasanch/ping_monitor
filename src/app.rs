@@ -1,7 +1,7 @@
 use crate::sound::SoundEvent;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const WIN: usize = 120;
@@ -451,6 +451,12 @@ struct ExportRow {
     cadence_ms: u64,
 }
 
+pub enum GatewayUpdate {
+    Unchanged,
+    Updated { old: String, new: String },
+    Added { idx: usize },
+}
+
 pub type NotifyFn = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct App {
@@ -473,6 +479,10 @@ pub struct App {
     pub lat_hist: Ring<Option<f64>>,
     pub jit_hist: Ring<f64>,
     pub extras: Vec<ExtraProbe>,
+    pub auto_gw_idx: Option<usize>,
+    /// Current auto-gateway address shared with its pinger task, so gateway
+    /// re-detection can retarget the probe live (same pattern as interval_ms).
+    pub gw_shared: Arc<Mutex<String>>,
     pub last_export: Option<String>,
     pub best_uptime_secs: u64,
     pub worst_loss_burst: u32,
@@ -662,6 +672,8 @@ impl App {
             lat_hist: Ring::new(POOL_HIST_CAP),
             jit_hist: Ring::new(POOL_HIST_CAP),
             extras: Vec::new(),
+            auto_gw_idx: None,
+            gw_shared: Default::default(),
             last_export: None,
             best_uptime_secs: 0,
             worst_loss_burst: 0,
@@ -927,6 +939,38 @@ impl App {
         if let Some((lvl, msg)) = log_msg {
             self.log(lvl, msg);
         }
+    }
+
+    /// Apply a gateway (re)detection result: update the auto-gateway extra in
+    /// place when the address changed, or create it when it first appears.
+    pub fn apply_gateway_update(&mut self, gw: &str) -> GatewayUpdate {
+        if let Some(i) = self.auto_gw_idx {
+            if let Some(e) = self.extras.get_mut(i) {
+                if e.host == gw {
+                    return GatewayUpdate::Unchanged;
+                }
+                let old = std::mem::replace(&mut e.host, gw.to_string());
+                e.reset();
+                return GatewayUpdate::Updated {
+                    old,
+                    new: gw.to_string(),
+                };
+            }
+        }
+        self.extras.push(ExtraProbe {
+            label: "gw".into(),
+            host: gw.to_string(),
+            port: 80,
+            last: None,
+            state: LinkState::Up,
+            total: 0,
+            lost: 0,
+            consec_loss: 0,
+            ring: Ring::new(30),
+        });
+        let idx = self.extras.len() - 1;
+        self.auto_gw_idx = Some(idx);
+        GatewayUpdate::Added { idx }
     }
 
     fn export_row(&self) -> ExportRow {
@@ -1908,5 +1952,45 @@ mod tests {
         a.set_wifi_rssi(None);
         assert_eq!(a.wifi_grade, None);
         assert!(a.events.len() >= events_before + 2, "logged wifi down");
+    }
+
+    #[test]
+    fn gateway_update_added_when_absent() {
+        let mut a = app_with_n_probes(1);
+        let r = a.apply_gateway_update("192.168.1.1");
+        assert!(matches!(r, GatewayUpdate::Added { idx: 0 }));
+        assert_eq!(a.auto_gw_idx, Some(0));
+        assert_eq!(a.extras[0].host, "192.168.1.1");
+        assert_eq!(a.extras[0].label, "gw");
+    }
+
+    #[test]
+    fn gateway_update_unchanged_when_same_host() {
+        let mut a = app_with_n_probes(1);
+        a.apply_gateway_update("192.168.1.1");
+        let r = a.apply_gateway_update("192.168.1.1");
+        assert!(matches!(r, GatewayUpdate::Unchanged));
+        assert_eq!(a.extras.len(), 1);
+    }
+
+    #[test]
+    fn gateway_update_replaces_host_and_resets_stats() {
+        let mut a = app_with_n_probes(1);
+        a.apply_gateway_update("192.168.1.1");
+        {
+            let e = &mut a.extras[0];
+            e.total = 10;
+            e.lost = 5;
+            e.consec_loss = 3;
+            e.state = LinkState::Down;
+            e.last = None;
+        }
+        let r = a.apply_gateway_update("10.0.0.1");
+        assert!(matches!(r, GatewayUpdate::Updated { .. }));
+        let e = &a.extras[0];
+        assert_eq!(e.host, "10.0.0.1");
+        assert_eq!(e.label, "gw");
+        assert_eq!(e.total, 0);
+        assert_eq!(e.state, LinkState::Up);
     }
 }
