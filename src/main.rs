@@ -296,7 +296,7 @@ async fn main() -> std::io::Result<()> {
             addr: host.clone(),
             port: *port,
             timeout_ms: app.cfg.timeout_ms,
-            alive_on_refused: false,
+            alive_on_rejected: false,
         };
         let stagger_ms = (idx as u64) * 200;
         let interval_handle = Arc::clone(&ping_interval_handle);
@@ -368,7 +368,7 @@ async fn main() -> std::io::Result<()> {
             addr: ex.host.clone(),
             port: ex.port,
             timeout_ms: app.cfg.timeout_ms,
-            alive_on_refused: false,
+            alive_on_rejected: false,
         };
         tokio::spawn(async move {
             let mut tick = interval(Duration::from_secs(5));
@@ -581,7 +581,7 @@ fn spawn_gateway_pinger(
                 addr,
                 port: 80,
                 timeout_ms,
-                alive_on_refused: true,
+                alive_on_rejected: true,
             };
             let s = pinger.ping().await;
             let _ = tx.send(AppMsg::ExtraPing(idx, s));
