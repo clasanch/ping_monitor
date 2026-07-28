@@ -11,9 +11,17 @@ pub struct TcpPinger {
     pub addr: String,
     pub port: u16,
     pub timeout_ms: u64,
-    /// Count ConnectionRefused as success: a RST proves the host is alive
-    /// even when the probed port is closed (e.g. router admin ports).
-    pub alive_on_refused: bool,
+    /// An actively rejected connection (refused or reset) counts as reachable
+    /// — a TCP RST confirms that the network path responded.
+    pub alive_on_rejected: bool,
+}
+
+fn error_counts_as_alive(enabled: bool, kind: std::io::ErrorKind) -> bool {
+    enabled
+        && matches!(
+            kind,
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+        )
 }
 
 impl TcpPinger {
@@ -24,9 +32,7 @@ impl TcpPinger {
         let res = timeout(dur, TcpStream::connect(&target)).await;
         let rtt = match res {
             Ok(Ok(_s)) => Some(start.elapsed().as_secs_f64() * 1000.0),
-            Ok(Err(e))
-                if self.alive_on_refused && e.kind() == std::io::ErrorKind::ConnectionRefused =>
-            {
+            Ok(Err(e)) if error_counts_as_alive(self.alive_on_rejected, e.kind()) => {
                 Some(start.elapsed().as_secs_f64() * 1000.0)
             }
             _ => None,
@@ -99,32 +105,48 @@ impl DnsProbe {
 mod tests {
     use super::*;
 
-    fn closed_port() -> u16 {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
+    #[test]
+    fn refused_counts_as_alive() {
+        assert!(error_counts_as_alive(
+            true,
+            std::io::ErrorKind::ConnectionRefused
+        ));
     }
 
-    #[tokio::test]
-    async fn refused_counts_as_alive_when_flag_set() {
-        let p = TcpPinger {
-            addr: "127.0.0.1".into(),
-            port: closed_port(),
-            timeout_ms: 500,
-            alive_on_refused: true,
-        };
-        assert!(p.ping().await.rtt_ms.is_some());
+    #[test]
+    fn reset_counts_as_alive() {
+        assert!(error_counts_as_alive(
+            true,
+            std::io::ErrorKind::ConnectionReset
+        ));
     }
 
-    #[tokio::test]
-    async fn refused_counts_as_loss_by_default() {
-        let p = TcpPinger {
-            addr: "127.0.0.1".into(),
-            port: closed_port(),
-            timeout_ms: 500,
-            alive_on_refused: false,
-        };
-        assert!(p.ping().await.rtt_ms.is_none());
+    #[test]
+    fn refused_ignored_when_disabled() {
+        assert!(!error_counts_as_alive(
+            false,
+            std::io::ErrorKind::ConnectionRefused
+        ));
+    }
+
+    #[test]
+    fn reset_ignored_when_disabled() {
+        assert!(!error_counts_as_alive(
+            false,
+            std::io::ErrorKind::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn timeout_never_counts_as_alive() {
+        assert!(!error_counts_as_alive(true, std::io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn unreachable_never_counts_as_alive() {
+        assert!(!error_counts_as_alive(
+            true,
+            std::io::ErrorKind::NetworkUnreachable
+        ));
     }
 }

@@ -32,6 +32,7 @@ pub fn default_gateway() -> Option<String> {
     None
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn valid_gw(tok: &str) -> Option<String> {
     match tok.parse::<std::net::Ipv4Addr>() {
         Ok(ip) if !ip.is_unspecified() => Some(ip.to_string()),
