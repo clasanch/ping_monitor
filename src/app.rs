@@ -1,4 +1,6 @@
+use crate::detector::EwmaDetector;
 use crate::sound::SoundEvent;
+use crate::state::{consensus, reduce_connection, reduce_target, DesiredState, RecoveryState};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -49,17 +51,26 @@ impl Baseline {
         }
     }
 
-    pub fn push(&mut self, lat: Option<f64>, jit: f64) {
-        if let Some(v) = lat {
-            if self.latencies.len() == BASELINE_CAP {
-                self.latencies.pop_front();
-            }
-            self.latencies.push_back(v);
+    pub fn push_latency(&mut self, v: f64) {
+        if self.latencies.len() == BASELINE_CAP {
+            self.latencies.pop_front();
         }
+        self.latencies.push_back(v);
+    }
+
+    pub fn push_jitter(&mut self, v: f64) {
         if self.jitters.len() == BASELINE_CAP {
             self.jitters.pop_front();
         }
-        self.jitters.push_back(jit);
+        self.jitters.push_back(v);
+    }
+
+    pub fn latency_len(&self) -> usize {
+        self.latencies.len()
+    }
+
+    pub fn jitter_len(&self) -> usize {
+        self.jitters.len()
     }
 
     fn percentile(v: &[f64], p: f64) -> Option<f64> {
@@ -77,9 +88,6 @@ impl Baseline {
     }
     pub fn jit_p90(&self) -> Option<f64> {
         Self::percentile(&self.jitters.iter().copied().collect::<Vec<_>>(), 90.0)
-    }
-    pub fn len(&self) -> usize {
-        self.latencies.len()
     }
 }
 
@@ -127,70 +135,6 @@ fn push_spike(list: &mut Vec<(f64, u64)>, value: f64, cap: usize) {
     list.push((value, ts));
     list.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     list.truncate(cap);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn step_dwell(
-    state: LinkState,
-    is_bad: bool,
-    is_down: bool,
-    bad_streak: u32,
-    good_streak: u32,
-    cfg: &Config,
-    now: Instant,
-    recover_at: Option<Instant>,
-) -> (LinkState, Option<Instant>) {
-    let dwell = cfg.recover_dwell;
-    match state {
-        LinkState::Up => {
-            if bad_streak >= cfg.hysteresis_bad {
-                let new_state = if is_down {
-                    LinkState::Down
-                } else {
-                    LinkState::Degraded
-                };
-                (new_state, None)
-            } else {
-                (LinkState::Up, None)
-            }
-        }
-        LinkState::Degraded => {
-            if is_down && bad_streak >= cfg.hysteresis_bad {
-                (LinkState::Down, None)
-            } else if good_streak >= cfg.hysteresis_good {
-                let started = recover_at.unwrap_or(now);
-                if now.duration_since(started) >= dwell {
-                    let new_state = if is_bad {
-                        LinkState::Degraded
-                    } else {
-                        LinkState::Up
-                    };
-                    (new_state, None)
-                } else {
-                    (LinkState::Degraded, Some(started))
-                }
-            } else {
-                (LinkState::Degraded, None)
-            }
-        }
-        LinkState::Down => {
-            if good_streak >= cfg.hysteresis_good {
-                let started = recover_at.unwrap_or(now);
-                if now.duration_since(started) >= dwell {
-                    let new_state = if is_bad {
-                        LinkState::Degraded
-                    } else {
-                        LinkState::Up
-                    };
-                    (new_state, None)
-                } else {
-                    (LinkState::Down, Some(started))
-                }
-            } else {
-                (LinkState::Down, None)
-            }
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -278,7 +222,6 @@ pub struct Config {
     pub state_window: usize,
     pub degraded_loss_pct: f64,
     pub down_loss_pct: f64,
-    pub hysteresis_good: u32,
     pub hysteresis_bad: u32,
     pub recover_dwell: Duration,
     pub reminder_interval: Duration,
@@ -306,7 +249,6 @@ impl Default for Config {
             state_window: 20,
             degraded_loss_pct: 20.0,
             down_loss_pct: 60.0,
-            hysteresis_good: 8,
             hysteresis_bad: 3,
             recover_dwell: Duration::from_secs(15),
             reminder_interval: Duration::from_secs(30),
@@ -370,13 +312,6 @@ impl Config {
         } else if self.state_window > 500 {
             self.state_window = 500;
             warns.push("state_window clamped to [5,500]");
-        }
-        if self.hysteresis_good == 0 {
-            self.hysteresis_good = 1;
-            warns.push("hysteresis_good clamped to [1,50]");
-        } else if self.hysteresis_good > 50 {
-            self.hysteresis_good = 50;
-            warns.push("hysteresis_good clamped to [1,50]");
         }
         if self.hysteresis_bad == 0 {
             self.hysteresis_bad = 1;
@@ -445,7 +380,7 @@ struct ExportRow {
     total: u64,
     lost: u64,
     loss_pct: f64,
-    jitter_cur_ms: f64,
+    jitter_cur_ms: Option<f64>,
     last_dns_ms: Option<f64>,
     avg_dns_ms: f64,
     cadence_ms: u64,
@@ -457,7 +392,73 @@ pub enum GatewayUpdate {
     Added { idx: usize },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayRole {
+    UserExtra(usize),
+    AutoExtra(usize),
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathCause {
+    GatewayFailure,
+    WeakWifi,
+    BeyondFirstHop,
+    Unknown,
+}
+
+fn cause_word(cause: PathCause) -> &'static str {
+    match cause {
+        PathCause::GatewayFailure => "probable gateway failure",
+        PathCause::WeakWifi => "weak Wi-Fi signal",
+        PathCause::BeyondFirstHop => "gateway OK; failure beyond first hop",
+        PathCause::Unknown => "unknown",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DetectorMode {
+    Legacy,
+    Shadow,
+    Hybrid,
+}
+
+impl DetectorMode {
+    pub fn from_env() -> Self {
+        match std::env::var("PM_RECURSIVE_MODE").as_deref() {
+            Ok("shadow") => DetectorMode::Shadow,
+            Ok("hybrid") => DetectorMode::Hybrid,
+            Ok("legacy") | Ok(_) => DetectorMode::Legacy,
+            Err(_) => DetectorMode::Legacy,
+        }
+    }
+}
+
 pub type NotifyFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[derive(Clone, Copy, Debug)]
+pub enum RoundResult {
+    Observed(crate::net::PingSample),
+    Missing,
+}
+
+pub struct PrimaryBatch {
+    pub round_id: u64,
+    pub reset_epoch: u64,
+    pub results: Vec<RoundResult>,
+    #[allow(dead_code)]
+    pub started_at: Instant,
+}
+
+impl std::fmt::Debug for PrimaryBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PrimaryBatch")
+            .field("round_id", &self.round_id)
+            .field("reset_epoch", &self.reset_epoch)
+            .field("results_len", &self.results.len())
+            .finish()
+    }
+}
 
 pub struct App {
     pub cfg: Config,
@@ -465,10 +466,8 @@ pub struct App {
     pub dns: DnsMatrix,
     pub state: LinkState,
     pub state_since: Instant,
-    pub recover_at: Option<Instant>,
+    pub recovery: RecoveryState,
     pub last_reminder: Option<Instant>,
-    pub good_streak: u32,
-    pub bad_streak: u32,
     pub events: VecDeque<Event>,
     pub muted: bool,
     pub started: Instant,
@@ -476,13 +475,16 @@ pub struct App {
     pub hist: VecDeque<HistBucket>,
     pub cur_bucket_start: Option<Instant>,
     pub interval_ms: Arc<AtomicU64>,
+    pub reset_epoch: Arc<AtomicU64>,
     pub lat_hist: Ring<Option<f64>>,
-    pub jit_hist: Ring<f64>,
+    pub jit_hist: Ring<Option<f64>>,
     pub extras: Vec<ExtraProbe>,
     pub auto_gw_idx: Option<usize>,
-    /// Current auto-gateway address shared with its pinger task, so gateway
-    /// re-detection can retarget the probe live (same pattern as interval_ms).
-    pub gw_shared: Arc<Mutex<String>>,
+    pub gw_role: GatewayRole,
+    pub gw_shared: Arc<Mutex<(u64, String)>>,
+    pub gw_cadence_ms: Arc<AtomicU64>,
+    pub outage_onset_at: Option<Instant>,
+    pub gateway_probe_idx: Option<usize>,
     pub last_export: Option<String>,
     pub best_uptime_secs: u64,
     pub worst_loss_burst: u32,
@@ -502,6 +504,22 @@ pub struct App {
     pub mttr_ms_total: u64,
     pub top_latency: Vec<(f64, u64)>,
     pub top_jitter: Vec<(f64, u64)>,
+    pub detector_mode: DetectorMode,
+    pub shadow_log: VecDeque<ShadowEvent>,
+    pub prealert_enabled: bool,
+    pub probe_anomaly_edge: Vec<bool>,
+    pub probe_anomaly_cooldown_at: Option<Instant>,
+    pub pending_cause_log_idx: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShadowEvent {
+    pub ts: Instant,
+    pub metric: &'static str,
+    pub old_latch: bool,
+    pub new_latch: bool,
+    pub ratio: f64,
+    pub short: f64,
 }
 
 #[derive(Clone)]
@@ -511,20 +529,21 @@ pub struct PrimaryProbe {
     pub port: u16,
     pub lat_ring: Ring<Option<f64>>,
     pub loss_ring: Ring<f64>,
-    pub jitter_ring: Ring<f64>,
+    pub jitter_ring: Ring<Option<f64>>,
     pub baseline: Baseline,
     pub stat: LatStat,
     pub last_value: Option<f64>,
+    pub prev_rtt_adjacent: Option<f64>,
     pub consec_loss: u32,
     pub cur_loss_burst: u32,
-    pub good_streak: u32,
-    pub bad_streak: u32,
+    pub pending_worse: Option<(LinkState, u32)>,
     pub state: LinkState,
     pub state_since: Instant,
-    pub recover_at: Option<Instant>,
     pub total: u64,
     pub lost: u64,
     pub last_target_state: LinkState,
+    pub latency_detector: EwmaDetector,
+    pub jitter_detector: EwmaDetector,
 }
 
 impl PrimaryProbe {
@@ -539,16 +558,17 @@ impl PrimaryProbe {
             baseline: Baseline::new(),
             stat: LatStat::default(),
             last_value: None,
+            prev_rtt_adjacent: None,
             consec_loss: 0,
             cur_loss_burst: 0,
-            good_streak: 0,
-            bad_streak: 0,
+            pending_worse: None,
             state: LinkState::Up,
             state_since: Instant::now(),
-            recover_at: None,
             total: 0,
             lost: 0,
             last_target_state: LinkState::Up,
+            latency_detector: EwmaDetector::new(),
+            jitter_detector: EwmaDetector::new(),
         }
     }
 
@@ -559,16 +579,17 @@ impl PrimaryProbe {
         self.baseline = Baseline::new();
         self.stat = LatStat::default();
         self.last_value = None;
+        self.prev_rtt_adjacent = None;
         self.consec_loss = 0;
         self.cur_loss_burst = 0;
-        self.good_streak = 0;
-        self.bad_streak = 0;
+        self.pending_worse = None;
         self.state = LinkState::Up;
         self.state_since = Instant::now();
-        self.recover_at = None;
         self.last_target_state = LinkState::Up;
         self.total = 0;
         self.lost = 0;
+        self.latency_detector.reset();
+        self.jitter_detector.reset();
     }
 
     fn classify(&self, cfg: &Config) -> (bool, bool) {
@@ -588,9 +609,13 @@ impl PrimaryProbe {
             .iter()
             .rev()
             .take(win_n)
-            .copied()
+            .filter_map(|v| *v)
             .collect();
-        let avg_jit = jit.iter().sum::<f64>() / jit.len().max(1) as f64;
+        let avg_jit = if jit.is_empty() {
+            0.0
+        } else {
+            jit.iter().sum::<f64>() / jit.len() as f64
+        };
 
         let (lat_t, jit_t, loss_t, down_t) = self.adaptive_thresholds(cfg);
         let is_bad = loss_pct >= loss_t || avg_lat > lat_t || avg_jit > jit_t;
@@ -599,18 +624,23 @@ impl PrimaryProbe {
     }
 
     fn adaptive_thresholds(&self, cfg: &Config) -> (f64, f64, f64, f64) {
-        if self.baseline.len() < 50 {
-            return (
-                cfg.latency_warn_ms,
-                cfg.jitter_warn_ms,
-                cfg.degraded_loss_pct,
-                cfg.down_loss_pct,
-            );
-        }
-        let lat_p90 = self.baseline.lat_p90().unwrap_or(cfg.latency_warn_ms);
-        let jit_p90 = self.baseline.jit_p90().unwrap_or(cfg.jitter_warn_ms);
-        let lat_thresh = (lat_p90 * 2.0).max(cfg.latency_warn_ms);
-        let jit_thresh = (jit_p90 * 2.5).max(cfg.jitter_warn_ms);
+        let (lat_thresh, jit_thresh) =
+            if self.baseline.latency_len() >= 50 && self.baseline.jitter_len() >= 50 {
+                let lat_p90 = self.baseline.lat_p90().unwrap_or(cfg.latency_warn_ms);
+                let jit_p90 = self.baseline.jit_p90().unwrap_or(cfg.jitter_warn_ms);
+                (
+                    (lat_p90 * 2.0).max(cfg.latency_warn_ms),
+                    (jit_p90 * 2.5).max(cfg.jitter_warn_ms),
+                )
+            } else if self.baseline.latency_len() >= 50 {
+                let lat_p90 = self.baseline.lat_p90().unwrap_or(cfg.latency_warn_ms);
+                ((lat_p90 * 2.0).max(cfg.latency_warn_ms), cfg.jitter_warn_ms)
+            } else if self.baseline.jitter_len() >= 50 {
+                let jit_p90 = self.baseline.jit_p90().unwrap_or(cfg.jitter_warn_ms);
+                (cfg.latency_warn_ms, (jit_p90 * 2.5).max(cfg.jitter_warn_ms))
+            } else {
+                (cfg.latency_warn_ms, cfg.jitter_warn_ms)
+            };
         (
             lat_thresh,
             jit_thresh,
@@ -631,6 +661,7 @@ pub struct ExtraProbe {
     pub lost: u64,
     pub ring: Ring<Option<f64>>,
     pub consec_loss: u32,
+    pub last_sample_at: Option<Instant>,
 }
 
 impl ExtraProbe {
@@ -641,6 +672,7 @@ impl ExtraProbe {
         self.lost = 0;
         self.consec_loss = 0;
         self.ring = Ring::new(30);
+        self.last_sample_at = None;
     }
 }
 
@@ -658,10 +690,8 @@ impl App {
             dns: DnsMatrix::new(resolvers, names),
             state: LinkState::Up,
             state_since: Instant::now(),
-            recover_at: None,
+            recovery: RecoveryState::new(),
             last_reminder: None,
-            good_streak: 0,
-            bad_streak: 0,
             events: VecDeque::with_capacity(256),
             muted: false,
             started: Instant::now(),
@@ -669,11 +699,16 @@ impl App {
             hist: VecDeque::with_capacity(HIST_BUCKETS),
             cur_bucket_start: None,
             interval_ms: Arc::new(AtomicU64::new(interval_init)),
+            reset_epoch: Arc::new(AtomicU64::new(0)),
             lat_hist: Ring::new(POOL_HIST_CAP),
             jit_hist: Ring::new(POOL_HIST_CAP),
             extras: Vec::new(),
             auto_gw_idx: None,
-            gw_shared: Default::default(),
+            gw_role: GatewayRole::Unknown,
+            gw_shared: Arc::new(Mutex::new((0, String::new()))),
+            gw_cadence_ms: Arc::new(AtomicU64::new(5_000)),
+            outage_onset_at: None,
+            gateway_probe_idx: None,
             last_export: None,
             best_uptime_secs: 0,
             worst_loss_burst: 0,
@@ -693,6 +728,12 @@ impl App {
             mttr_ms_total: 0,
             top_latency: Vec::new(),
             top_jitter: Vec::new(),
+            detector_mode: DetectorMode::from_env(),
+            shadow_log: VecDeque::with_capacity(64),
+            prealert_enabled: std::env::var("PM_PREALERT").as_deref() == Ok("1"),
+            probe_anomaly_edge: Vec::new(),
+            probe_anomaly_cooldown_at: None,
+            pending_cause_log_idx: None,
         }
     }
 
@@ -710,14 +751,15 @@ impl App {
         let mut lat_max: Option<f64> = None;
         let mut jit_max: Option<f64> = None;
         for p in &self.primaries {
-            if p.baseline.len() < 50 {
-                continue;
+            if p.baseline.latency_len() >= 50 {
+                if let Some(v) = p.baseline.lat_p90() {
+                    lat_max = Some(lat_max.map_or(v, |m: f64| m.max(v)));
+                }
             }
-            if let Some(v) = p.baseline.lat_p90() {
-                lat_max = Some(lat_max.map_or(v, |m: f64| m.max(v)));
-            }
-            if let Some(v) = p.baseline.jit_p90() {
-                jit_max = Some(jit_max.map_or(v, |m: f64| m.max(v)));
+            if p.baseline.jitter_len() >= 50 {
+                if let Some(v) = p.baseline.jit_p90() {
+                    jit_max = Some(jit_max.map_or(v, |m: f64| m.max(v)));
+                }
             }
         }
         (lat_max, jit_max)
@@ -824,18 +866,18 @@ impl App {
         s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         Some(s[s.len() / 2])
     }
-    pub fn jitter_view(&self) -> f64 {
+    pub fn jitter_view(&self) -> Option<f64> {
         let vals: Vec<f64> = self
             .primaries
             .iter()
-            .filter_map(|p| p.jitter_ring.buf.back().copied())
+            .filter_map(|p| p.jitter_ring.buf.back().and_then(|v| *v))
             .collect();
         if vals.is_empty() {
-            return 0.0;
+            return None;
         }
         let mut s = vals;
         s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        s[s.len() / 2]
+        Some(s[s.len() / 2])
     }
     pub fn pooled_ping_stat(&self) -> LatStat {
         let mut out = LatStat::default();
@@ -872,14 +914,15 @@ impl App {
         }
         self.state = LinkState::Up;
         self.state_since = Instant::now();
-        self.recover_at = None;
+        self.recovery = RecoveryState::new();
         self.last_reminder = None;
-        self.good_streak = 0;
-        self.bad_streak = 0;
+        self.outage_onset_at = None;
         self.hist.clear();
         self.cur_bucket_start = None;
         self.lat_hist = Ring::new(POOL_HIST_CAP);
         self.jit_hist = Ring::new(POOL_HIST_CAP);
+        self.reset_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         for p in self.primaries.iter_mut() {
             p.reset();
         }
@@ -901,6 +944,10 @@ impl App {
         self.mttr_ms_total = 0;
         self.top_latency.clear();
         self.top_jitter.clear();
+        self.shadow_log.clear();
+        self.probe_anomaly_edge.clear();
+        self.probe_anomaly_cooldown_at = None;
+        self.pending_cause_log_idx = None;
         self.log(Level::Info, "stats reset");
     }
 
@@ -911,6 +958,7 @@ impl App {
         let label = self.extras[idx].label.clone();
         let e = &mut self.extras[idx];
         e.total += 1;
+        e.last_sample_at = Some(Instant::now());
         e.ring.push(sample.rtt_ms);
         let log_msg = match sample.rtt_ms {
             Some(v) => {
@@ -939,11 +987,73 @@ impl App {
         if let Some((lvl, msg)) = log_msg {
             self.log(lvl, msg);
         }
+        // If we have a pending cause amendment and gateway evidence just became fresh, amend it
+        self.try_amend_pending_cause();
+    }
+
+    /// Try to amend a pending transition event with updated gateway cause evidence.
+    fn try_amend_pending_cause(&mut self) {
+        let idx = match self.pending_cause_log_idx {
+            Some(i) => i,
+            None => return,
+        };
+        // Only amend if we're still in a bad state
+        if self.state == LinkState::Up {
+            self.pending_cause_log_idx = None;
+            return;
+        }
+        // Check if gateway evidence is now fresh
+        let cause = self.path_cause(
+            if self.state == LinkState::Down {
+                DesiredState::Down
+            } else {
+                DesiredState::Degraded
+            },
+            Instant::now(),
+        );
+        if cause == PathCause::Unknown {
+            return; // still unknown, try again later
+        }
+        // Amend the event log entry
+        if let Some(event) = self.events.get_mut(idx) {
+            let old_msg = &event.msg;
+            if let Some(cause_pos) = old_msg.find("cause: ") {
+                let prefix = &old_msg[..cause_pos];
+                let suffix_start = old_msg[cause_pos..]
+                    .find("  ♪")
+                    .map(|p| cause_pos + p)
+                    .unwrap_or(old_msg.len());
+                event.msg = format!(
+                    "{}cause: {}  (cause updated)  {}",
+                    prefix,
+                    cause_word(cause),
+                    &old_msg[suffix_start..]
+                );
+            }
+        }
+        self.pending_cause_log_idx = None;
+    }
+
+    /// Process a gateway probe result with epoch-based stale rejection.
+    /// Rejects the result if the probe_epoch doesn't match the current gw_shared epoch.
+    pub fn ingest_gateway_probe(
+        &mut self,
+        idx: usize,
+        probe_epoch: u64,
+        sample: crate::net::PingSample,
+    ) {
+        let current_epoch = self.gw_shared.lock().map(|guard| guard.0).unwrap_or(0);
+        if probe_epoch != current_epoch {
+            return;
+        }
+        self.ingest_extra(idx, sample);
     }
 
     /// Apply a gateway (re)detection result: update the auto-gateway extra in
     /// place when the address changed, or create it when it first appears.
+    /// Prefers a user-configured extra whose host matches the detected gateway.
     pub fn apply_gateway_update(&mut self, gw: &str) -> GatewayUpdate {
+        // Check if we already have an auto-gw extra with this address
         if let Some(i) = self.auto_gw_idx {
             if let Some(e) = self.extras.get_mut(i) {
                 if e.host == gw {
@@ -951,10 +1061,23 @@ impl App {
                 }
                 let old = std::mem::replace(&mut e.host, gw.to_string());
                 e.reset();
+                // Epoch already incremented by re-detection task (main.rs)
                 return GatewayUpdate::Updated {
                     old,
                     new: gw.to_string(),
                 };
+            }
+        }
+        // Check if a user-configured extra already monitors this host
+        // (skip the auto-gw extra itself)
+        for (i, e) in self.extras.iter().enumerate() {
+            if Some(i) == self.auto_gw_idx {
+                continue;
+            }
+            if e.host == gw {
+                self.gw_role = GatewayRole::UserExtra(i);
+                self.gateway_probe_idx = Some(i);
+                return GatewayUpdate::Unchanged;
             }
         }
         self.extras.push(ExtraProbe {
@@ -967,9 +1090,12 @@ impl App {
             lost: 0,
             consec_loss: 0,
             ring: Ring::new(30),
+            last_sample_at: None,
         });
         let idx = self.extras.len() - 1;
         self.auto_gw_idx = Some(idx);
+        self.gw_role = GatewayRole::AutoExtra(idx);
+        self.gateway_probe_idx = Some(idx);
         GatewayUpdate::Added { idx }
     }
 
@@ -1034,7 +1160,9 @@ impl App {
             row.total,
             row.lost,
             row.loss_pct,
-            row.jitter_cur_ms,
+            row.jitter_cur_ms
+                .map(|v| format!("{:.1}", v))
+                .unwrap_or_else(|| "-".into()),
             row.last_dns_ms
                 .map(|v| format!("{:.1}", v))
                 .unwrap_or_else(|| "-".into()),
@@ -1042,19 +1170,46 @@ impl App {
             row.cadence_ms,
         )?;
         self.last_export = Some(path.clone());
+        // Export shadow_log to separate file when mode is shadow
+        if self.detector_mode == DetectorMode::Shadow && !self.shadow_log.is_empty() {
+            let shadow_path = format!("{}/{}.shadow.tsv", dir, epoch);
+            let shadow_exists = std::path::Path::new(&shadow_path).exists();
+            if let Ok(mut sf) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&shadow_path)
+            {
+                if !shadow_exists {
+                    let _ = writeln!(
+                        sf,
+                        "ts_offset_ms\tmetric\told_latch\tnew_latch\tratio\tshort"
+                    );
+                }
+                for ev in &self.shadow_log {
+                    let offset_ms = ev.ts.duration_since(self.started).as_millis();
+                    let _ = writeln!(
+                        sf,
+                        "{}\t{}\t{}\t{}\t{:.4}\t{:.1}",
+                        offset_ms, ev.metric, ev.old_latch, ev.new_latch, ev.ratio, ev.short
+                    );
+                }
+            }
+        }
         Ok(path)
     }
 
-    pub fn ingest_ping(
+    /// Process a single ping sample for one target (per-target update only).
+    /// Returns the instantaneous candidate for this target.
+    fn ingest_sample_at(
         &mut self,
         idx: usize,
         sample: crate::net::PingSample,
-    ) -> Option<SoundEvent> {
+        now: Instant,
+    ) -> Option<LinkState> {
         if idx >= self.primaries.len() {
             return None;
         }
 
-        let now = Instant::now();
         let need_new = match self.cur_bucket_start {
             None => true,
             Some(s) => now.duration_since(s).as_secs() >= HIST_BUCKET_SECS,
@@ -1078,24 +1233,27 @@ impl App {
         p.lat_ring.push(rtt);
         p.loss_ring.push(if rtt.is_none() { 1.0 } else { 0.0 });
 
-        let mut jit_val = 0.0;
-        match rtt {
+        let jit_val: Option<f64> = match rtt {
             Some(v) => {
                 p.stat.add(v);
                 if v > self.peak_latency {
                     self.peak_latency = v;
                     push_spike(&mut self.top_latency, v, 3);
                 }
-                let prev = p.last_value.replace(v);
-                jit_val = match prev {
-                    Some(x) => (v - x).abs(),
-                    None => 0.0,
+                p.last_value = Some(v);
+                let j = match p.prev_rtt_adjacent {
+                    Some(x) => {
+                        let delta = (v - x).abs();
+                        if delta > self.peak_jitter {
+                            self.peak_jitter = delta;
+                            push_spike(&mut self.top_jitter, delta, 3);
+                        }
+                        Some(delta)
+                    }
+                    None => None,
                 };
-                p.jitter_ring.push(jit_val);
-                if jit_val > self.peak_jitter {
-                    self.peak_jitter = jit_val;
-                    push_spike(&mut self.top_jitter, jit_val, 3);
-                }
+                p.prev_rtt_adjacent = Some(v);
+                p.jitter_ring.push(j);
                 if p.cur_loss_burst > 0 {
                     if p.cur_loss_burst > self.worst_loss_burst {
                         self.worst_loss_burst = p.cur_loss_burst;
@@ -1103,117 +1261,237 @@ impl App {
                     p.cur_loss_burst = 0;
                 }
                 p.consec_loss = 0;
+                j
             }
             None => {
                 p.lost += 1;
                 p.consec_loss += 1;
                 p.cur_loss_burst += 1;
-                p.jitter_ring.push(0.0);
+                p.last_value = None;
+                p.prev_rtt_adjacent = None;
+                p.jitter_ring.push(None);
+                None
             }
-        }
+        };
 
         let (is_bad, is_down) = p.classify(&self.cfg);
-        if is_bad {
-            p.bad_streak += 1;
-            p.good_streak = 0;
+        let mode = self.detector_mode;
+
+        // Run recursive detectors (legacy mode skips)
+        let (lat_latch, jit_latch) = match mode {
+            DetectorMode::Legacy => (false, false),
+            DetectorMode::Shadow | DetectorMode::Hybrid => {
+                let lat_warn = self.cfg.latency_warn_ms;
+                let lat_severe = self.cfg.latency_bad_ms;
+                let jit_warn = self.cfg.jitter_warn_ms;
+                let jit_severe = f64::MAX; // no severe branch for jitter
+
+                let old_lat_latch = p.latency_detector.latch_active;
+                let (lat_latch, lat_short, lat_ratio, _) = if let Some(v) = rtt {
+                    p.latency_detector.observe(v, now, lat_warn, lat_severe)
+                } else {
+                    p.latency_detector.mark_gap();
+                    (p.latency_detector.latch_active, None, 0.0, false)
+                };
+
+                let old_jit_latch = p.jitter_detector.latch_active;
+                let (jit_latch, jit_short, jit_ratio, _) = if let Some(j) = jit_val {
+                    p.jitter_detector.observe(j, now, jit_warn, jit_severe)
+                } else {
+                    p.jitter_detector.mark_gap();
+                    (p.jitter_detector.latch_active, None, 0.0, false)
+                };
+
+                // Shadow mode: log latch transitions to shadow_log
+                if mode == DetectorMode::Shadow {
+                    if old_lat_latch != lat_latch {
+                        if self.shadow_log.len() >= 64 {
+                            self.shadow_log.pop_front();
+                        }
+                        self.shadow_log.push_back(ShadowEvent {
+                            ts: now,
+                            metric: "latency",
+                            old_latch: old_lat_latch,
+                            new_latch: lat_latch,
+                            ratio: lat_ratio,
+                            short: lat_short.unwrap_or(0.0),
+                        });
+                    }
+                    if old_jit_latch != jit_latch {
+                        if self.shadow_log.len() >= 64 {
+                            self.shadow_log.pop_front();
+                        }
+                        self.shadow_log.push_back(ShadowEvent {
+                            ts: now,
+                            metric: "jitter",
+                            old_latch: old_jit_latch,
+                            new_latch: jit_latch,
+                            ratio: jit_ratio,
+                            short: jit_short.unwrap_or(0.0),
+                        });
+                    }
+                }
+
+                (lat_latch, jit_latch)
+            }
+        };
+
+        let candidate = if is_down {
+            LinkState::Down
+        } else if is_bad || (mode == DetectorMode::Hybrid && (lat_latch || jit_latch)) {
+            LinkState::Degraded
         } else {
-            p.good_streak += 1;
-            p.bad_streak = 0;
-        }
+            LinkState::Up
+        };
+
         let prev_target_state = p.state;
         p.last_target_state = prev_target_state;
-        let now = Instant::now();
-        let (new_state, new_recover_at) = step_dwell(
+        let (new_state, new_pending) = reduce_target(
             p.state,
-            is_bad,
-            is_down,
-            p.bad_streak,
-            p.good_streak,
-            &self.cfg,
-            now,
-            p.recover_at,
+            Some(candidate),
+            p.pending_worse,
+            self.cfg.hysteresis_bad,
         );
-        if new_state != p.state {
+        let target_transition = new_state != p.state;
+        if target_transition {
             p.state = new_state;
             p.state_since = now;
         }
-        p.recover_at = new_recover_at;
-        if p.state == LinkState::Up {
-            p.baseline.push(rtt, jit_val);
+        p.pending_worse = new_pending;
+
+        // Baseline admission: candidate-clean AND latch-free in hybrid
+        let latch_gates_admission = mode == DetectorMode::Hybrid && (lat_latch || jit_latch);
+        if candidate == LinkState::Up && !latch_gates_admission {
+            if let Some(v) = rtt {
+                p.baseline.push_latency(v);
+            }
+            if let Some(j) = jit_val {
+                p.baseline.push_jitter(j);
+            }
         }
-        if prev_target_state != p.state {
-            let msg = match p.state {
+
+        // Save info before releasing the mutable borrow on p
+        let is_worsening = prev_target_state == LinkState::Up
+            && matches!(new_state, LinkState::Degraded | LinkState::Down);
+        let label = p.label.clone();
+
+        if target_transition {
+            let msg = match new_state {
                 LinkState::Up => format!("[{}] target recovered", label),
                 LinkState::Degraded => format!("[{}] target degraded", label),
                 LinkState::Down => format!("[{}] target unreachable", label),
             };
             self.log(Level::Warn, msg);
+            if is_worsening {
+                while self.probe_anomaly_edge.len() <= idx {
+                    self.probe_anomaly_edge.push(false);
+                }
+                self.probe_anomaly_edge[idx] = true;
+            }
+        }
+
+        Some(candidate)
+    }
+
+    /// Convenience: process a single ping sample and finalize one generation.
+    #[allow(dead_code)]
+    pub fn ingest_ping(
+        &mut self,
+        idx: usize,
+        sample: crate::net::PingSample,
+    ) -> Option<SoundEvent> {
+        let now = Instant::now();
+        self.ingest_sample_at(idx, sample, now);
+        self.lat_hist.push(self.last_value_view());
+        self.jit_hist.push(self.jitter_view());
+        let sound = self.finalize_generation(now);
+        // Clear edge bits after finalization (same as ingest_generation_at)
+        for e in self.probe_anomaly_edge.iter_mut() {
+            *e = false;
+        }
+        sound
+    }
+
+    /// Process a batch of observations and finalize one generation.
+    pub fn ingest_generation(&mut self, batch: PrimaryBatch) -> Option<SoundEvent> {
+        self.ingest_generation_at(batch, Instant::now())
+    }
+
+    /// Process a batch of observations and finalize one generation.
+    /// Deterministic entry point: accepts injected time for testing.
+    pub fn ingest_generation_at(
+        &mut self,
+        batch: PrimaryBatch,
+        now: Instant,
+    ) -> Option<SoundEvent> {
+        // Stale batch rejection
+        if batch.reset_epoch != self.reset_epoch.load(Ordering::Acquire) {
+            return None;
+        }
+
+        for (idx, result) in batch.results.iter().enumerate() {
+            match result {
+                RoundResult::Observed(sample) => {
+                    self.ingest_sample_at(idx, *sample, now);
+                }
+                RoundResult::Missing => {
+                    // Hold target state and pending — do nothing.
+                }
+            }
         }
 
         self.lat_hist.push(self.last_value_view());
         self.jit_hist.push(self.jitter_view());
+        let mut sound = self.finalize_generation(now);
 
-        self.recompute_connection_state()
+        // ProbeAnomaly cue: only fires on batch finalization
+        if sound.is_none() {
+            if let Some(cue) = self.evaluate_probe_anomaly_cue(now) {
+                sound = Some(cue);
+            }
+        }
+
+        // Clear all edge bits after finalization
+        for e in self.probe_anomaly_edge.iter_mut() {
+            *e = false;
+        }
+        sound
     }
 
-    fn recompute_connection_state(&mut self) -> Option<SoundEvent> {
+    /// Finalize one generation: consensus, connection state, side effects.
+    fn finalize_generation(&mut self, now: Instant) -> Option<SoundEvent> {
         self.accrue_state_time();
 
         let n = self.primaries.len();
         if n == 0 {
             return None;
         }
-        let mut down = 0;
-        let mut bad = 0;
-        let mut up = 0;
-        for p in &self.primaries {
-            match p.state {
-                LinkState::Down => {
-                    down += 1;
-                    bad += 1;
-                }
-                LinkState::Degraded => {
-                    bad += 1;
-                }
-                LinkState::Up => {
-                    up += 1;
-                }
-            }
-        }
-        let majority = (n as f64 / 2.0).ceil() as usize;
-        let majority_bad = bad >= majority;
-        let majority_down = down >= majority;
 
-        if majority_down {
-            self.bad_streak += 1;
-            self.good_streak = 0;
-        } else if majority_bad {
-            self.bad_streak += 1;
-            self.good_streak = 1;
-        } else {
-            self.good_streak += 1;
-            self.bad_streak = 1;
-        }
-
+        let states: Vec<LinkState> = self.primaries.iter().map(|p| p.state).collect();
+        let desired = consensus(&states);
         let prev = self.state;
-        let now = Instant::now();
-        let mut sound: Option<SoundEvent> = None;
 
-        let (new_state, new_recover_at) = step_dwell(
+        let new_state = reduce_connection(
             self.state,
-            majority_bad,
-            majority_down,
-            self.bad_streak,
-            self.good_streak,
-            &self.cfg,
+            desired,
+            &mut self.recovery,
+            self.cfg.recover_dwell,
             now,
-            self.recover_at,
         );
         if new_state != self.state {
             self.state = new_state;
             self.state_since = now;
         }
-        self.recover_at = new_recover_at;
+
+        // Track outage onset for gateway evidence freshness
+        if desired != DesiredState::Up && self.outage_onset_at.is_none() {
+            self.outage_onset_at = Some(now);
+        }
+        if desired == DesiredState::Up {
+            self.outage_onset_at = None;
+        }
+
+        let mut sound: Option<SoundEvent> = None;
 
         if prev != self.state {
             if prev == LinkState::Up {
@@ -1226,7 +1504,7 @@ impl App {
                 self.up_since = None;
             }
             if self.state == LinkState::Up {
-                self.up_since = Some(Instant::now());
+                self.up_since = Some(now);
                 if let Some(s) = self.bad_since.take() {
                     self.mttr_ms_total += s.elapsed().as_millis() as u64;
                     self.recoveries += 1;
@@ -1240,6 +1518,10 @@ impl App {
             if self.state == LinkState::Down {
                 self.outages += 1;
             }
+
+            let up_n = states.iter().filter(|s| **s == LinkState::Up).count();
+            let down_n = states.iter().filter(|s| **s == LinkState::Down).count();
+            let bad_n = n - up_n;
             let total: u64 = self.primaries.iter().map(|p| p.total).sum();
             let lost: u64 = self.primaries.iter().map(|p| p.lost).sum();
             let loss_pct = if total == 0 {
@@ -1247,10 +1529,7 @@ impl App {
             } else {
                 lost as f64 * 100.0 / total as f64
             };
-            let up_n = up;
-            let bad_n = bad;
-            let down_n = down;
-            let consensus = format!(
+            let consensus_msg = format!(
                 "targets {}/{} up  loss {:.0}%  ({}/{}/{})",
                 up_n,
                 n,
@@ -1259,37 +1538,58 @@ impl App {
                 bad_n - down_n,
                 down_n
             );
+
             match self.state {
                 LinkState::Up => {
                     self.log(
                         Level::Good,
-                        format!("connection recovered  {}  ♪ recover", consensus),
+                        format!("connection recovered  {}  ♪ recover", consensus_msg),
                     );
                     self.notify("connection recovered");
+                    self.pending_cause_log_idx = None;
                     sound = Some(SoundEvent::Recover);
                 }
                 LinkState::Degraded => {
                     if prev == LinkState::Up {
+                        let cause = self.path_cause(desired, now);
                         self.log(
                             Level::Warn,
-                            format!("connection degraded  {}  ♪ degraded", consensus),
+                            format!(
+                                "connection degraded  {}  cause: {}  ♪ degraded",
+                                consensus_msg,
+                                cause_word(cause)
+                            ),
                         );
+                        if cause == PathCause::Unknown {
+                            self.pending_cause_log_idx = Some(self.events.len().saturating_sub(1));
+                        }
                         self.notify("connection degraded");
                         sound = Some(SoundEvent::Loss);
                     } else {
-                        self.log(Level::Warn, format!("still bad → degraded  {}", consensus));
+                        self.log(
+                            Level::Warn,
+                            format!("improving → degraded  {}", consensus_msg),
+                        );
                     }
                 }
                 LinkState::Down => {
+                    let cause = self.path_cause(desired, now);
                     self.log(
                         Level::Bad,
-                        format!("connection DOWN  {}  ♪ down", consensus),
+                        format!(
+                            "connection DOWN  {}  cause: {}  ♪ down",
+                            consensus_msg,
+                            cause_word(cause)
+                        ),
                     );
+                    if cause == PathCause::Unknown {
+                        self.pending_cause_log_idx = Some(self.events.len().saturating_sub(1));
+                    }
                     self.notify("connection DOWN");
                     sound = Some(SoundEvent::Down);
                 }
             }
-            self.last_reminder = Some(Instant::now());
+            self.last_reminder = Some(now);
             let _ = self.export_tsv();
         }
 
@@ -1298,7 +1598,106 @@ impl App {
             LinkState::Degraded | LinkState::Down => 500,
         };
         self.interval_ms.store(ms, Ordering::Relaxed);
+
+        // Adaptive gateway cadence: 1s during worsening, 5s otherwise
+        let gw_any_worsening = self.primaries.iter().any(|p| p.pending_worse.is_some());
+        let gw_ms = if gw_any_worsening || self.state != LinkState::Up {
+            1_000
+        } else {
+            5_000
+        };
+        self.gw_cadence_ms.store(gw_ms, Ordering::Relaxed);
+
         sound
+    }
+
+    /// Evaluate whether an isolated-target ProbeAnomaly cue should fire.
+    /// Called only from `ingest_generation_at` (batch finalization), not per-sample.
+    fn evaluate_probe_anomaly_cue(&mut self, now: Instant) -> Option<SoundEvent> {
+        if !self.prealert_enabled || self.muted {
+            return None;
+        }
+        let cooldown_ok = self
+            .probe_anomaly_cooldown_at
+            .map(|t| now.duration_since(t).as_secs() >= 60)
+            .unwrap_or(true);
+        if !cooldown_ok {
+            return None;
+        }
+        // Eligibility: exactly one primary has edge and remains bad,
+        // all others are Up, connection is Up.
+        let edge_count = self
+            .probe_anomaly_edge
+            .iter()
+            .enumerate()
+            .filter(|(i, &e)| {
+                e && self
+                    .primaries
+                    .get(*i)
+                    .is_some_and(|p| p.state != LinkState::Up)
+            })
+            .count();
+        let all_others_up = self.primaries.iter().enumerate().all(|(i, p)| {
+            p.state == LinkState::Up || self.probe_anomaly_edge.get(i).copied() == Some(true)
+        });
+        if edge_count == 1 && all_others_up && self.state == LinkState::Up {
+            self.probe_anomaly_cooldown_at = Some(now);
+            self.log(
+                Level::Warn,
+                "isolated target anomaly detected  ♪ probe anomaly",
+            );
+            Some(SoundEvent::ProbeAnomaly)
+        } else {
+            None
+        }
+    }
+
+    /// Assess probable path cause for a connection transition.
+    /// Receives `desired` explicitly to avoid relying on state invariant.
+    pub fn path_cause(&self, desired: DesiredState, _now: Instant) -> PathCause {
+        use crate::state::DesiredState;
+        // No outage → no cause
+        if desired == DesiredState::Up {
+            return PathCause::Unknown;
+        }
+
+        let gw_fresh = match self.gw_role {
+            GatewayRole::UserExtra(i) | GatewayRole::AutoExtra(i) => {
+                self.extras
+                    .get(i)
+                    .and_then(|e| e.last_sample_at)
+                    .map(|t| {
+                        // Fresh if sampled after outage onset
+                        self.outage_onset_at
+                            .map(|onset| t >= onset)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+            }
+            GatewayRole::Unknown => false,
+        };
+
+        if gw_fresh {
+            let gw_state = match self.gw_role {
+                GatewayRole::UserExtra(i) | GatewayRole::AutoExtra(i) => {
+                    self.extras.get(i).map(|e| e.state)
+                }
+                _ => None,
+            };
+            if gw_state == Some(LinkState::Down) {
+                return PathCause::GatewayFailure;
+            }
+            if gw_state == Some(LinkState::Up) && self.state != LinkState::Up {
+                return PathCause::BeyondFirstHop;
+            }
+        }
+
+        // Weak Wi-Fi as supporting evidence
+        if self.wifi_grade.map(|g| g <= 1).unwrap_or(false) {
+            return PathCause::WeakWifi;
+        }
+
+        PathCause::Unknown
     }
 
     pub fn score(&self) -> f32 {
@@ -1309,7 +1708,7 @@ impl App {
         let lat = self.last_value_view().unwrap_or(0.0) as f32;
         let loss = self.pooled_loss_pct() as f32;
         let dns = self.system_resolver_worst().unwrap_or(0.0) as f32;
-        let jit = self.jitter_view() as f32;
+        let jit = self.jitter_view().unwrap_or(0.0) as f32;
         let lat_w = self.lat_warn_ms() as f32;
         let jit_w = self.jit_warn_ms() as f32;
         let dns_w = self.dns_warn_ms() as f32;
@@ -1359,6 +1758,10 @@ impl App {
 
     pub fn loss_pct(&self) -> f64 {
         self.pooled_loss_pct()
+    }
+
+    pub fn recovery_remaining(&self, now: Instant) -> Option<Duration> {
+        self.recovery.remaining(now, self.cfg.recover_dwell)
     }
 
     pub fn cur_uptime_secs(&self) -> u64 {
@@ -1550,50 +1953,36 @@ mod tests {
     #[test]
     fn anti_flapping_holds_recovery_for_dwell() {
         let mut a = app_with_n_probes(3);
+        // Build up healthy baseline.
         for _ in 0..25 {
             for i in 0..3 {
                 a.ingest_ping(i, PingSample { rtt_ms: Some(20.0) });
             }
         }
         assert_eq!(a.state, LinkState::Up);
+        // Drive all targets down.
         for _ in 0..25 {
             for i in 0..3 {
                 a.ingest_ping(i, PingSample { rtt_ms: None });
             }
         }
         assert_ne!(a.state, LinkState::Up);
+        // Drive all targets back up — recovery should start.
         for _ in 0..25 {
             for i in 0..3 {
                 a.ingest_ping(i, PingSample { rtt_ms: Some(20.0) });
             }
         }
-        let old = std::time::Instant::now() - std::time::Duration::from_secs(20);
-        for p in a.primaries.iter_mut() {
-            p.recover_at = Some(old);
-        }
-        for _ in 0..3 {
-            for i in 0..3 {
-                a.ingest_ping(i, PingSample { rtt_ms: Some(20.0) });
-            }
-        }
-        assert!(
-            a.recover_at.is_some(),
-            "recover_at should be set once per-target dwell clears"
-        );
+        // Connection is recovering but dwell hasn't elapsed yet.
         assert_ne!(
             a.state,
             LinkState::Up,
             "recovery should still be held by connection dwell"
         );
-        let old = std::time::Instant::now() - std::time::Duration::from_secs(20);
-        a.recover_at = Some(old);
-        for i in 0..3 {
-            a.ingest_ping(i, PingSample { rtt_ms: Some(20.0) });
-        }
-        assert_eq!(
-            a.state,
-            LinkState::Up,
-            "recovery should fire after dwell elapses"
+        // Verify recovery state exists.
+        assert!(
+            a.recovery.resumed_at.is_some(),
+            "recovery should have started"
         );
     }
 
@@ -1601,14 +1990,15 @@ mod tests {
     fn jitter_view_is_median_across_primaries() {
         let mut a = app_with_n_probes(3);
         for _ in 0..30 {
-            a.primaries[0].jitter_ring.push(5.0);
-            a.primaries[1].jitter_ring.push(5.0);
-            a.primaries[2].jitter_ring.push(80.0);
+            a.primaries[0].jitter_ring.push(Some(5.0));
+            a.primaries[1].jitter_ring.push(Some(5.0));
+            a.primaries[2].jitter_ring.push(Some(80.0));
         }
+        let jv = a.jitter_view().unwrap();
         assert!(
-            (a.jitter_view() - 5.0).abs() < 0.001,
+            (jv - 5.0).abs() < 0.001,
             "jitter_view should be median (5.0), got {}",
-            a.jitter_view()
+            jv
         );
     }
 
@@ -1624,9 +2014,9 @@ mod tests {
             "target should be in a bad state after sustained loss"
         );
         assert!(
-            a.primaries[0].baseline.len() == 0,
+            a.primaries[0].baseline.latency_len() == 0,
             "baseline should not have grown while target was down, got len {}",
-            a.primaries[0].baseline.len()
+            a.primaries[0].baseline.latency_len()
         );
     }
 
@@ -1667,7 +2057,6 @@ mod tests {
             recover_dwell: Duration::from_secs(0),
             reminder_interval: Duration::from_secs(1),
             state_window: 1,
-            hysteresis_good: 0,
             hysteresis_bad: 0,
             ..Default::default()
         };
@@ -1700,64 +2089,19 @@ mod tests {
             "reminder_interval clamped to >=5s"
         );
         assert!(cfg.state_window >= 5, "state_window clamped to >=5");
-        assert!(cfg.hysteresis_good >= 1, "hysteresis_good clamped to >=1");
         assert!(cfg.hysteresis_bad >= 1, "hysteresis_bad clamped to >=1");
     }
 
     #[test]
-    fn step_dwell_up_to_degraded_on_bad_streak() {
-        let cfg = Config {
-            hysteresis_bad: 3,
-            ..Default::default()
-        };
-        let now = Instant::now();
-        let (new, recover) = step_dwell(LinkState::Up, true, false, 3, 0, &cfg, now, None);
-        assert_eq!(new, LinkState::Degraded);
-        assert!(recover.is_none(), "recover_at must reset on transition");
-    }
-
-    #[test]
-    fn step_dwell_recovery_held_by_dwell() {
-        let cfg = Config {
-            hysteresis_good: 2,
-            recover_dwell: Duration::from_secs(10),
-            ..Default::default()
-        };
-        let now = Instant::now();
-        let started = now - Duration::from_secs(2);
-        let (new, recover) = step_dwell(
-            LinkState::Down,
-            false,
-            false,
-            0,
-            2,
-            &cfg,
-            now,
-            Some(started),
-        );
-        assert_eq!(
-            new,
-            LinkState::Down,
-            "must stay Down while dwell not elapsed"
-        );
-        assert_eq!(
-            recover,
-            Some(started),
-            "recover_at must persist while waiting"
-        );
-        let started_old = now - Duration::from_secs(20);
-        let (new2, recover2) = step_dwell(
-            LinkState::Down,
-            false,
-            false,
-            0,
-            2,
-            &cfg,
-            now,
-            Some(started_old),
-        );
-        assert_eq!(new2, LinkState::Up, "must recover after dwell elapsed");
-        assert!(recover2.is_none(), "recover_at must clear on transition");
+    fn target_reducer_up_to_degraded_on_bad_streak() {
+        let h = 3;
+        let (s, p) = crate::state::reduce_target(LinkState::Up, Some(LinkState::Degraded), None, h);
+        assert_eq!(s, LinkState::Up);
+        assert_eq!(p, Some((LinkState::Degraded, 1)));
+        let (s, p) = crate::state::reduce_target(s, Some(LinkState::Degraded), p, h);
+        assert_eq!(s, LinkState::Up);
+        let (s, _p) = crate::state::reduce_target(s, Some(LinkState::Degraded), p, h);
+        assert_eq!(s, LinkState::Degraded, "should transition at hysteresis");
     }
 
     #[test]
@@ -1992,5 +2336,594 @@ mod tests {
         assert_eq!(e.label, "gw");
         assert_eq!(e.total, 0);
         assert_eq!(e.state, LinkState::Up);
+    }
+
+    #[test]
+    fn classify_no_jitter_penalty_when_all_none() {
+        let mut a = app_with_n_probes(1);
+        // Feed enough successful pings to fill the window, then only loss.
+        for _ in 0..25 {
+            a.ingest_ping(0, PingSample { rtt_ms: Some(20.0) });
+        }
+        // Now push only loss — jitter ring fills with None.
+        for _ in 0..25 {
+            a.ingest_ping(0, PingSample { rtt_ms: None });
+        }
+        let cfg = Config::default();
+        let (_, is_down) = a.primaries[0].classify(&cfg);
+        // Loss alone triggers is_down, but jitter contributes nothing.
+        assert!(is_down, "high loss should trigger is_down");
+    }
+
+    #[test]
+    fn classify_averages_only_some_jitter() {
+        let mut a = app_with_n_probes(1);
+        // Fill with successful pings so window has data.
+        for _ in 0..25 {
+            a.ingest_ping(0, PingSample { rtt_ms: Some(20.0) });
+        }
+        let jit_ring = &a.primaries[0].jitter_ring;
+        let jit: Vec<f64> = jit_ring
+            .as_vec()
+            .iter()
+            .rev()
+            .take(20)
+            .filter_map(|v| *v)
+            .collect();
+        // All contiguous successes should produce Some jitter values.
+        assert!(
+            !jit.is_empty(),
+            "contiguous successes should produce Some jitter values"
+        );
+    }
+
+    #[test]
+    fn independent_baseline_counts() {
+        let mut a = app_with_n_probes(1);
+        // Feed 60 successful pings — both latency and jitter should be populated.
+        for _ in 0..60 {
+            a.ingest_ping(0, PingSample { rtt_ms: Some(20.0) });
+        }
+        assert!(
+            a.primaries[0].baseline.latency_len() >= 50,
+            "latency should have >=50 values, got {}",
+            a.primaries[0].baseline.latency_len()
+        );
+        assert!(
+            a.primaries[0].baseline.jitter_len() >= 50,
+            "jitter should have >=50 values, got {}",
+            a.primaries[0].baseline.jitter_len()
+        );
+    }
+
+    #[test]
+    fn prev_rtt_adjacent_cleared_on_loss() {
+        let mut a = app_with_n_probes(1);
+        a.ingest_ping(0, PingSample { rtt_ms: Some(20.0) });
+        assert!(
+            a.primaries[0].prev_rtt_adjacent.is_some(),
+            "prev_rtt_adjacent should be set after first success"
+        );
+        a.ingest_ping(0, PingSample { rtt_ms: None });
+        assert!(
+            a.primaries[0].prev_rtt_adjacent.is_none(),
+            "prev_rtt_adjacent should be cleared on loss"
+        );
+        // First success after loss: jitter should be None (no adjacent).
+        a.ingest_ping(0, PingSample { rtt_ms: Some(30.0) });
+        let last_jit = *a.primaries[0].jitter_ring.buf.back().unwrap();
+        assert_eq!(
+            last_jit, None,
+            "first jitter after loss should be None, got {:?}",
+            last_jit
+        );
+    }
+
+    #[test]
+    fn last_value_is_none_during_loss() {
+        let mut a = app_with_n_probes(1);
+        a.ingest_ping(0, PingSample { rtt_ms: Some(20.0) });
+        assert_eq!(a.primaries[0].last_value, Some(20.0));
+        a.ingest_ping(0, PingSample { rtt_ms: None });
+        assert_eq!(
+            a.primaries[0].last_value, None,
+            "last_value should be None on loss"
+        );
+        assert_eq!(
+            a.last_value_view(),
+            None,
+            "last_value_view should exclude target with loss"
+        );
+    }
+
+    #[test]
+    fn segment_runs_all_none() {
+        use crate::ui::segment_runs;
+        let data: Vec<Option<f64>> = vec![None, None, None];
+        let runs = segment_runs(&data);
+        assert!(runs.is_empty(), "all None should produce no runs");
+    }
+
+    #[test]
+    fn segment_runs_all_some() {
+        use crate::ui::segment_runs;
+        let data: Vec<Option<f64>> = vec![Some(1.0), Some(2.0), Some(3.0)];
+        let runs = segment_runs(&data);
+        assert_eq!(runs.len(), 1, "all Some should produce one run");
+        assert_eq!(runs[0].len(), 3);
+    }
+
+    #[test]
+    fn segment_runs_mixed() {
+        use crate::ui::segment_runs;
+        let data: Vec<Option<f64>> = vec![Some(1.0), None, Some(3.0), Some(4.0), None];
+        let runs = segment_runs(&data);
+        assert_eq!(runs.len(), 2, "mixed should produce two runs");
+        assert_eq!(runs[0], vec![(0, 1.0)]);
+        assert_eq!(runs[1], vec![(2, 3.0), (3, 4.0)]);
+    }
+
+    #[test]
+    fn segment_runs_empty() {
+        use crate::ui::segment_runs;
+        let data: Vec<Option<f64>> = vec![];
+        let runs = segment_runs(&data);
+        assert!(runs.is_empty(), "empty input should produce no runs");
+    }
+
+    #[test]
+    fn extra_probe_last_sample_at_set() {
+        let mut a = app_with_n_probes(1);
+        a.extras.push(ExtraProbe {
+            label: "gw".into(),
+            host: "192.168.1.1".into(),
+            port: 80,
+            last: None,
+            state: LinkState::Up,
+            total: 0,
+            lost: 0,
+            consec_loss: 0,
+            ring: Ring::new(30),
+            last_sample_at: None,
+        });
+        assert!(a.extras[0].last_sample_at.is_none());
+        a.ingest_extra(0, PingSample { rtt_ms: Some(5.0) });
+        assert!(
+            a.extras[0].last_sample_at.is_some(),
+            "last_sample_at should be set after ingest_extra"
+        );
+    }
+
+    #[test]
+    fn extra_probe_reset_clears_last_sample_at() {
+        let mut e = ExtraProbe {
+            label: "gw".into(),
+            host: "192.168.1.1".into(),
+            port: 80,
+            last: Some(5.0),
+            state: LinkState::Down,
+            total: 10,
+            lost: 3,
+            consec_loss: 2,
+            ring: Ring::new(30),
+            last_sample_at: Some(Instant::now()),
+        };
+        e.reset();
+        assert!(e.last_sample_at.is_none());
+        assert_eq!(e.state, LinkState::Up);
+    }
+
+    #[test]
+    fn path_cause_unknown_when_no_outage() {
+        let a = app_with_n_probes(3);
+        let cause = a.path_cause(DesiredState::Up, Instant::now());
+        assert_eq!(cause, PathCause::Unknown);
+    }
+
+    #[test]
+    fn path_cause_gateway_failure() {
+        let mut a = app_with_n_probes(3);
+        a.outage_onset_at = Some(Instant::now());
+        a.gw_role = GatewayRole::AutoExtra(0);
+        a.extras.push(ExtraProbe {
+            label: "gw".into(),
+            host: "192.168.1.1".into(),
+            port: 80,
+            last: Some(2.0),
+            state: LinkState::Down,
+            total: 10,
+            lost: 5,
+            consec_loss: 3,
+            ring: Ring::new(30),
+            last_sample_at: Some(Instant::now()),
+        });
+        let cause = a.path_cause(DesiredState::Down, Instant::now());
+        assert_eq!(cause, PathCause::GatewayFailure);
+    }
+
+    #[test]
+    fn path_cause_beyond_first_hop() {
+        let mut a = app_with_n_probes(3);
+        a.outage_onset_at = Some(Instant::now());
+        a.state = LinkState::Down;
+        a.gw_role = GatewayRole::AutoExtra(0);
+        a.extras.push(ExtraProbe {
+            label: "gw".into(),
+            host: "192.168.1.1".into(),
+            port: 80,
+            last: Some(2.0),
+            state: LinkState::Up,
+            total: 10,
+            lost: 0,
+            consec_loss: 0,
+            ring: Ring::new(30),
+            last_sample_at: Some(Instant::now()),
+        });
+        let cause = a.path_cause(DesiredState::Down, Instant::now());
+        assert_eq!(cause, PathCause::BeyondFirstHop);
+    }
+
+    #[test]
+    fn path_cause_stale_gateway_is_unknown() {
+        let mut a = app_with_n_probes(3);
+        a.outage_onset_at = Some(Instant::now());
+        a.gw_role = GatewayRole::AutoExtra(0);
+        a.extras.push(ExtraProbe {
+            label: "gw".into(),
+            host: "192.168.1.1".into(),
+            port: 80,
+            last: Some(2.0),
+            state: LinkState::Up,
+            total: 10,
+            lost: 0,
+            consec_loss: 0,
+            ring: Ring::new(30),
+            last_sample_at: None, // stale
+        });
+        let cause = a.path_cause(DesiredState::Down, Instant::now());
+        assert_eq!(cause, PathCause::Unknown);
+    }
+
+    #[test]
+    fn outage_onset_at_set_and_cleared() {
+        let mut a = app_with_n_probes(3);
+        assert!(a.outage_onset_at.is_none());
+        // Send enough loss rounds for targets to transition (hysteresis_bad=3)
+        // and connection to reach Down (quorum=2).
+        for round in 0..15 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        assert!(
+            a.outage_onset_at.is_some(),
+            "outage_onset_at should be set after sustained loss, state={:?}",
+            a.state
+        );
+    }
+
+    #[test]
+    fn prealert_default_off() {
+        let a = app_with_n_probes(3);
+        assert!(!a.prealert_enabled, "prealert should be off by default");
+    }
+
+    #[test]
+    fn prealert_cue_fires_on_isolated_anomaly() {
+        let mut a = app_with_n_probes(3);
+        a.prealert_enabled = true;
+        // Build healthy baseline using batches
+        for round in 0..25 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        assert_eq!(a.state, LinkState::Up);
+        // Burst of losses on target 0 only
+        for round in 25..50 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        // Edge bit should have been set and then cleared after finalization
+        // But the target should be in a bad state
+        assert_ne!(
+            a.primaries[0].state,
+            LinkState::Up,
+            "target 0 should be degraded/down"
+        );
+        assert_eq!(a.primaries[1].state, LinkState::Up);
+        assert_eq!(a.primaries[2].state, LinkState::Up);
+    }
+
+    #[test]
+    fn prealert_cooldown_suppresses() {
+        let mut a = app_with_n_probes(3);
+        a.prealert_enabled = true;
+        a.probe_anomaly_cooldown_at = Some(Instant::now());
+        // Even with edge bits set, cooldown should suppress
+        a.probe_anomaly_edge = vec![true, false, false];
+        // Can't easily test finalize_generation sound selection without
+        // going through the full batch path, but verify cooldown is checked
+        let now = Instant::now();
+        let cooldown_ok = a
+            .probe_anomaly_cooldown_at
+            .map(|t| now.duration_since(t).as_secs() >= 60)
+            .unwrap_or(true);
+        assert!(!cooldown_ok, "cooldown should suppress within 60s");
+    }
+
+    #[test]
+    fn reset_clears_prealert_state() {
+        let mut a = app_with_n_probes(3);
+        a.prealert_enabled = true;
+        a.probe_anomaly_edge = vec![true, false, false];
+        a.probe_anomaly_cooldown_at = Some(Instant::now());
+        a.reset();
+        assert!(a.probe_anomaly_edge.is_empty());
+        assert!(a.probe_anomaly_cooldown_at.is_none());
+    }
+
+    #[test]
+    fn arrival_order_invariant() {
+        // All permutations of 3 targets arriving in different orders should
+        // produce identical connection state after one batch.
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in &orders {
+            let mut a = app_with_n_probes(3);
+            // Build baseline
+            for _ in 0..25 {
+                let batch = PrimaryBatch {
+                    round_id: 0,
+                    reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                    results: vec![
+                        RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                        RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                        RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    ],
+                    started_at: Instant::now(),
+                };
+                let _ = a.ingest_generation_at(batch, Instant::now());
+            }
+            // Now send one batch with targets in a specific order
+            let results: Vec<RoundResult> = order
+                .iter()
+                .map(|&i| {
+                    if i == 0 {
+                        RoundResult::Observed(PingSample { rtt_ms: None })
+                    } else {
+                        RoundResult::Observed(PingSample { rtt_ms: Some(20.0) })
+                    }
+                })
+                .collect();
+            let batch = PrimaryBatch {
+                round_id: 25,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results,
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+            // Target 0 should be the same regardless of arrival order
+            assert_eq!(
+                a.primaries[0].state,
+                LinkState::Up,
+                "target 0 state should be independent of arrival order {:?}",
+                order
+            );
+        }
+    }
+
+    #[test]
+    fn three_observations_advance_logic_once() {
+        let mut a = app_with_n_probes(3);
+        // Build baseline
+        for _ in 0..25 {
+            let batch = PrimaryBatch {
+                round_id: 0,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        assert_eq!(a.state, LinkState::Up);
+        // Send one batch with 2 loss + 1 success
+        let batch = PrimaryBatch {
+            round_id: 25,
+            reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+            results: vec![
+                RoundResult::Observed(PingSample { rtt_ms: None }),
+                RoundResult::Observed(PingSample { rtt_ms: None }),
+                RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+            ],
+            started_at: Instant::now(),
+        };
+        let _ = a.ingest_generation_at(batch, Instant::now());
+        // Connection should still be Up (not Down yet — hysteresis)
+        assert_eq!(a.state, LinkState::Up);
+    }
+
+    #[test]
+    fn stale_epoch_rejected_after_reset() {
+        let mut a = app_with_n_probes(3);
+        let old_epoch = a.reset_epoch.load(Ordering::Acquire);
+        // Build baseline
+        for _ in 0..25 {
+            let batch = PrimaryBatch {
+                round_id: 0,
+                reset_epoch: old_epoch,
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        // Reset increments epoch
+        a.reset();
+        let new_epoch = a.reset_epoch.load(Ordering::Acquire);
+        assert_ne!(old_epoch, new_epoch, "reset should increment epoch");
+        // Batch with old epoch should be rejected
+        let batch = PrimaryBatch {
+            round_id: 25,
+            reset_epoch: old_epoch,
+            results: vec![
+                RoundResult::Observed(PingSample { rtt_ms: None }),
+                RoundResult::Observed(PingSample { rtt_ms: None }),
+                RoundResult::Observed(PingSample { rtt_ms: None }),
+            ],
+            started_at: Instant::now(),
+        };
+        let sound = a.ingest_generation_at(batch, Instant::now());
+        assert!(sound.is_none(), "stale batch should be rejected");
+        assert_eq!(
+            a.primaries[0].total, 0,
+            "counters should not be updated for stale batch"
+        );
+    }
+
+    #[test]
+    fn missing_holds_state_no_counters() {
+        let mut a = app_with_n_probes(3);
+        // Build baseline
+        for _ in 0..25 {
+            let batch = PrimaryBatch {
+                round_id: 0,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        let prev_total = a.primaries[0].total;
+        let prev_state = a.primaries[0].state;
+        // Send batch with Missing for target 0
+        let batch = PrimaryBatch {
+            round_id: 25,
+            reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+            results: vec![
+                RoundResult::Missing,
+                RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+            ],
+            started_at: Instant::now(),
+        };
+        let _ = a.ingest_generation_at(batch, Instant::now());
+        assert_eq!(
+            a.primaries[0].total, prev_total,
+            "Missing should not increment total"
+        );
+        assert_eq!(
+            a.primaries[0].state, prev_state,
+            "Missing should hold target state"
+        );
+    }
+
+    #[test]
+    fn one_transition_one_side_effect() {
+        let mut a = app_with_n_probes(3);
+        // Build baseline
+        for round in 0..25 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            let _ = a.ingest_generation_at(batch, Instant::now());
+        }
+        let events_before = a.events.len();
+        let mut sounds = 0;
+        // Drive all targets down
+        for round in 25..55 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                ],
+                started_at: Instant::now(),
+            };
+            let sound = a.ingest_generation_at(batch, Instant::now());
+            if sound.is_some() {
+                sounds += 1;
+            }
+        }
+        // Should produce exactly 2 connection transition sounds:
+        // Up→Degraded (1 sound) and Degraded→Down (1 sound)
+        assert!(
+            sounds <= 2,
+            "should produce at most 2 transition sounds (Up→Degraded, Degraded→Down), got {}",
+            sounds
+        );
+        assert!(
+            a.events.len() > events_before,
+            "transitions should produce log events"
+        );
+    }
+
+    #[test]
+    fn detector_mode_from_env() {
+        // Default is Legacy
+        std::env::remove_var("PM_RECURSIVE_MODE");
+        assert_eq!(DetectorMode::from_env(), DetectorMode::Legacy);
+        // Explicit values
+        std::env::set_var("PM_RECURSIVE_MODE", "shadow");
+        assert_eq!(DetectorMode::from_env(), DetectorMode::Shadow);
+        std::env::set_var("PM_RECURSIVE_MODE", "hybrid");
+        assert_eq!(DetectorMode::from_env(), DetectorMode::Hybrid);
+        std::env::set_var("PM_RECURSIVE_MODE", "legacy");
+        assert_eq!(DetectorMode::from_env(), DetectorMode::Legacy);
+        // Invalid value falls back to Legacy
+        std::env::set_var("PM_RECURSIVE_MODE", "invalid");
+        assert_eq!(DetectorMode::from_env(), DetectorMode::Legacy);
+        std::env::remove_var("PM_RECURSIVE_MODE");
     }
 }

@@ -63,3 +63,7 @@ PRs are reviewed within a week. Small PRs (tests, typo fixes, dependency bumps, 
 ## Licensing
 
 By contributing you agree that your changes are licensed under the MIT license, same as the rest of the project.
+
+## Audio and code assets
+
+Any future audio or code asset incorporated into this project must record source, version, author, and license before merging. This applies to sound files, synthesis code borrowed from other projects, and any third-party code beyond standard dependencies.

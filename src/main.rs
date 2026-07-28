@@ -1,24 +1,29 @@
 mod app;
+mod detector;
 mod gateway;
 mod insight;
 mod net;
 mod sound;
+mod state;
 mod ui;
 mod wifi;
 
-use app::{App, Config};
+use app::{App, Config, PrimaryBatch, RoundResult};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::DefaultTerminal;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 use tokio::time::interval;
 
 #[derive(Debug)]
 enum AppMsg {
-    Ping(usize, net::PingSample),
+    PrimaryBatch(PrimaryBatch),
     Dns(usize, usize, Option<f64>),
     ExtraPing(usize, net::PingSample),
+    GatewayProbeResult(usize, u64, net::PingSample),
     TraceLine(String),
     TraceDone,
     WifiRssi(Option<i16>),
@@ -156,6 +161,11 @@ async fn main() -> std::io::Result<()> {
             .push(app::PrimaryProbe::new(label, host, *port));
     }
 
+    if app.primaries.is_empty() {
+        eprintln!("error: no valid primary targets. Set PM_TARGETS=label:host:port,...");
+        std::process::exit(1);
+    }
+
     if let Ok(raw) = std::env::var("PM_EXTRAS") {
         for piece in raw.split(',') {
             let parts: Vec<&str> = piece.splitn(3, ':').collect();
@@ -178,6 +188,7 @@ async fn main() -> std::io::Result<()> {
                 lost: 0,
                 consec_loss: 0,
                 ring: app::Ring::new(30),
+                last_sample_at: None,
             });
         }
         if !app.extras.is_empty() {
@@ -197,6 +208,8 @@ async fn main() -> std::io::Result<()> {
             app.extras.iter().any(|e| e.host == *gw) || primaries.iter().any(|(_, h, _)| h == gw);
         if !monitored {
             app.auto_gw_idx = Some(app.extras.len());
+            app.gw_role = app::GatewayRole::AutoExtra(app.extras.len());
+            app.gateway_probe_idx = Some(app.extras.len());
             app.extras.push(app::ExtraProbe {
                 label: "gw".into(),
                 host: gw.clone(),
@@ -207,6 +220,7 @@ async fn main() -> std::io::Result<()> {
                 lost: 0,
                 consec_loss: 0,
                 ring: app::Ring::new(30),
+                last_sample_at: None,
             });
             app.log(
                 app::Level::Info,
@@ -215,7 +229,7 @@ async fn main() -> std::io::Result<()> {
         }
     }
     if let Ok(mut cur) = app.gw_shared.lock() {
-        *cur = gw_now.clone().unwrap_or_default();
+        cur.1 = gw_now.clone().unwrap_or_default();
     }
 
     // Re-detect the default route periodically: roaming to another network
@@ -234,16 +248,23 @@ async fn main() -> std::io::Result<()> {
                     .await
                     .ok()
                     .flatten();
-                if let Some(gw) = new {
-                    let changed = match shared.lock() {
-                        Ok(mut cur) if *cur != gw => {
-                            *cur = gw.clone();
-                            true
+                match new {
+                    Some(gw) => {
+                        let changed = match shared.lock() {
+                            Ok(mut cur) if cur.1 != gw => {
+                                cur.0 += 1; // increment epoch on address change
+                                cur.1 = gw.clone();
+                                true
+                            }
+                            _ => false,
+                        };
+                        if changed {
+                            let _ = tx.send(AppMsg::GatewayNew(gw));
                         }
-                        _ => false,
-                    };
-                    if changed {
-                        let _ = tx.send(AppMsg::GatewayNew(gw));
+                    }
+                    None => {
+                        // Detection failed — signal None to clear gateway evidence
+                        let _ = tx.send(AppMsg::GatewayNew(String::new()));
                     }
                 }
             }
@@ -290,25 +311,72 @@ async fn main() -> std::io::Result<()> {
         });
     }
 
-    for (idx, (_label, host, port)) in primaries.iter().enumerate() {
+    // Coordinator: owns all probes, launches per-round via JoinSet.
+    {
         let tx = tx.clone();
-        let pinger = net::TcpPinger {
-            addr: host.clone(),
-            port: *port,
-            timeout_ms: app.cfg.timeout_ms,
-            alive_on_rejected: false,
-        };
-        let stagger_ms = (idx as u64) * 200;
         let interval_handle = Arc::clone(&ping_interval_handle);
+        let reset_epoch = Arc::clone(&app.reset_epoch);
+        let cfg_timeout_ms = app.cfg.timeout_ms;
+        let n = app.primaries.len();
+        let pingers: Vec<net::TcpPinger> = primaries
+            .iter()
+            .map(|(_label, host, port)| net::TcpPinger {
+                addr: host.clone(),
+                port: *port,
+                timeout_ms: cfg_timeout_ms,
+                alive_on_rejected: false,
+            })
+            .collect();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(stagger_ms)).await;
+            let mut round_id: u64 = 0;
             loop {
-                let ms = interval_handle
+                let round_epoch = reset_epoch.load(std::sync::atomic::Ordering::Acquire);
+                let started_at = Instant::now();
+
+                let mut set = JoinSet::new();
+                for (idx, pinger) in pingers.iter().enumerate() {
+                    let pinger = pinger.clone();
+                    set.spawn(async move { (idx, pinger.ping().await) });
+                }
+
+                // Deadline: probe's internal timeout + scheduling margin.
+                const ROUND_MARGIN_MS: u64 = 200;
+                let deadline_ms = cfg_timeout_ms + ROUND_MARGIN_MS;
+
+                let results = match tokio::time::timeout(
+                    Duration::from_millis(deadline_ms),
+                    collect_round(&mut set, n),
+                )
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let mut r = vec![RoundResult::Missing; n];
+                        while let Some(res) = set.try_join_next() {
+                            if let Ok((idx, sample)) = res {
+                                r[idx] = RoundResult::Observed(sample);
+                            }
+                        }
+                        r
+                    }
+                };
+
+                set.abort_all();
+
+                let _ = tx.send(AppMsg::PrimaryBatch(PrimaryBatch {
+                    round_id,
+                    reset_epoch: round_epoch,
+                    results,
+                    started_at,
+                }));
+                round_id += 1;
+
+                let elapsed = started_at.elapsed().as_millis() as u64;
+                let interval = interval_handle
                     .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(50);
-                tokio::time::sleep(Duration::from_millis(ms)).await;
-                let s = pinger.ping().await;
-                let _ = tx.send(AppMsg::Ping(idx, s));
+                    .max(200);
+                let sleep_ms = interval.saturating_sub(elapsed).max(200);
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
             }
         });
     }
@@ -386,6 +454,7 @@ async fn main() -> std::io::Result<()> {
             idx,
             Arc::clone(&app.gw_shared),
             app.cfg.timeout_ms,
+            Arc::clone(&app.gw_cadence_ms),
             tx.clone(),
         );
     }
@@ -425,38 +494,48 @@ async fn run(
                 return Ok(());
             };
             match msg {
-                AppMsg::Ping(i, s) => emit(audio, app.ingest_ping(i, s), app.muted),
+                AppMsg::PrimaryBatch(batch) => emit(audio, app.ingest_generation(batch), app.muted),
                 AppMsg::Dns(r, d, v) => {
                     let _ = app.ingest_dns(r, d, v);
                 }
                 AppMsg::ExtraPing(i, s) => app.ingest_extra(i, s),
+                AppMsg::GatewayProbeResult(i, epoch, s) => app.ingest_gateway_probe(i, epoch, s),
                 AppMsg::TraceLine(line) => app.log(app::Level::Info, line),
                 AppMsg::TraceDone => app.log(app::Level::Info, "traceroute finished"),
                 AppMsg::WifiRssi(v) => app.set_wifi_rssi(v),
-                AppMsg::GatewayNew(gw) => match app.apply_gateway_update(&gw) {
-                    app::GatewayUpdate::Unchanged => {}
-                    app::GatewayUpdate::Updated { old, new } => {
-                        app.log(
-                            app::Level::Info,
-                            format!(
-                                "gateway changed: {} → {} (network/roaming switch)",
-                                old, new
-                            ),
-                        );
+                AppMsg::GatewayNew(gw) => {
+                    if gw.is_empty() {
+                        // Detection failed — clear gateway evidence
+                        app.gw_role = app::GatewayRole::Unknown;
+                        app.log(app::Level::Warn, "gateway detection failed");
+                    } else {
+                        match app.apply_gateway_update(&gw) {
+                            app::GatewayUpdate::Unchanged => {}
+                            app::GatewayUpdate::Updated { old, new } => {
+                                app.log(
+                                    app::Level::Info,
+                                    format!(
+                                        "gateway changed: {} → {} (network/roaming switch)",
+                                        old, new
+                                    ),
+                                );
+                            }
+                            app::GatewayUpdate::Added { idx } => {
+                                app.log(
+                                    app::Level::Info,
+                                    format!("gateway detected: {} (extra [gw])", gw),
+                                );
+                                spawn_gateway_pinger(
+                                    idx,
+                                    Arc::clone(&app.gw_shared),
+                                    app.cfg.timeout_ms,
+                                    Arc::clone(&app.gw_cadence_ms),
+                                    tx.clone(),
+                                );
+                            }
+                        }
                     }
-                    app::GatewayUpdate::Added { idx } => {
-                        app.log(
-                            app::Level::Info,
-                            format!("gateway detected: {} (extra [gw])", gw),
-                        );
-                        spawn_gateway_pinger(
-                            idx,
-                            Arc::clone(&app.gw_shared),
-                            app.cfg.timeout_ms,
-                            tx.clone(),
-                        );
-                    }
-                },
+                }
                 AppMsg::Quit => return Ok(()),
             }
         }
@@ -561,19 +640,34 @@ fn emit(
     }
 }
 
+/// Collect all probe results from the JoinSet. Continues past JoinError
+/// (panicked probe stays Missing; round continues).
+async fn collect_round(set: &mut JoinSet<(usize, net::PingSample)>, n: usize) -> Vec<RoundResult> {
+    let mut results = vec![RoundResult::Missing; n];
+    while let Some(res) = set.join_next().await {
+        if let Ok((idx, sample)) = res {
+            results[idx] = RoundResult::Observed(sample);
+        }
+    }
+    results
+}
+
 /// Probe the auto-gateway on a 5s cadence, reading the address from the
 /// shared handle so re-detection retargets the probe without a respawn.
 fn spawn_gateway_pinger(
     idx: usize,
-    shared: Arc<std::sync::Mutex<String>>,
+    shared: Arc<std::sync::Mutex<(u64, String)>>,
     timeout_ms: u64,
+    gw_cadence_ms: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<AppMsg>,
 ) {
     tokio::spawn(async move {
-        let mut tick = interval(Duration::from_secs(5));
         loop {
-            tick.tick().await;
-            let addr = shared.lock().map(|g| g.clone()).unwrap_or_default();
+            let ms = gw_cadence_ms
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .max(1000);
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            let (epoch, addr) = shared.lock().map(|g| g.clone()).unwrap_or_default();
             if addr.is_empty() {
                 continue;
             }
@@ -584,7 +678,7 @@ fn spawn_gateway_pinger(
                 alive_on_rejected: true,
             };
             let s = pinger.ping().await;
-            let _ = tx.send(AppMsg::ExtraPing(idx, s));
+            let _ = tx.send(AppMsg::GatewayProbeResult(idx, epoch, s));
         }
     });
 }
