@@ -28,6 +28,7 @@ pub enum SoundEvent {
     Down,
     Recover,
     Shimmer,
+    ProbeAnomaly,
 }
 
 #[derive(Clone)]
@@ -196,6 +197,12 @@ pub fn chime_shimmer() -> impl Source<Item = f32> {
     delayed(NoteSpec::pad(1318.51, 320), 0, 0.10)
 }
 
+pub fn chime_probe_anomaly() -> impl Source<Item = f32> {
+    let n1 = delayed(NoteSpec::soft(880.00, 100), 0, 0.25);
+    let n2 = delayed(NoteSpec::soft(1174.66, 120), 80, 0.25);
+    n1.mix(n2)
+}
+
 pub fn spawn_audio() -> Option<(mpsc::UnboundedSender<SoundEvent>, Arc<AudioState>)> {
     use rodio::{OutputStream, Sink};
     let (stream, handle) = OutputStream::try_default().ok()?;
@@ -216,6 +223,7 @@ pub fn spawn_audio() -> Option<(mpsc::UnboundedSender<SoundEvent>, Arc<AudioStat
                 SoundEvent::Loss => sink.append(chime_loss()),
                 SoundEvent::Down => sink.append(chime_down()),
                 SoundEvent::Shimmer => sink.append(chime_shimmer()),
+                SoundEvent::ProbeAnomaly => sink.append(chime_probe_anomaly()),
             }
             sink.detach();
         }

@@ -17,6 +17,28 @@ const WARN: Color = Color::Indexed(179);
 const BAD: Color = Color::Indexed(174);
 const DIM: Color = Color::Indexed(236);
 
+/// Split a slice of optional values into contiguous runs of present values.
+/// Each run is a Vec of (original_index, value) pairs. Used to render chart
+/// segments without bridging across gaps.
+pub(crate) fn segment_runs(data: &[Option<f64>]) -> Vec<Vec<(usize, f64)>> {
+    let mut runs = Vec::new();
+    let mut current: Vec<(usize, f64)> = Vec::new();
+    for (i, v) in data.iter().enumerate() {
+        match v {
+            Some(x) => current.push((i, *x)),
+            None => {
+                if !current.is_empty() {
+                    runs.push(std::mem::take(&mut current));
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    runs
+}
+
 fn header_block(title: &str) -> Block<'_> {
     Block::default()
         .borders(Borders::ALL)
@@ -247,13 +269,12 @@ fn draw_insights(f: &mut Frame, insights: &[Insight], area: Rect) {
 
 fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
     let samples: Vec<Option<f64>> = app.lat_hist.as_vec();
-    let points: Vec<(f64, f64)> = samples
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| v.map(|x| (i as f64, x)))
-        .collect();
+    let runs = segment_runs(&samples);
     let ring_len = samples.len();
-    let data_max = points.iter().map(|(_, y)| *y).fold(0.0_f64, f64::max);
+    let data_max = runs
+        .iter()
+        .flat_map(|r| r.iter().map(|(_, y)| *y))
+        .fold(0.0_f64, f64::max);
     let mut y_max = data_max * 1.2;
     let warn_floor = app.lat_warn_ms() * 0.5;
     if y_max < warn_floor {
@@ -262,19 +283,22 @@ fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
     let y_max = (y_max / 10.0).ceil() * 10.0;
 
     let stat = app.pooled_ping_stat();
-    let cur = app.last_value_view().unwrap_or(0.0);
+    let cur = app.last_value_view();
     let lwarn = app.lat_warn_ms();
     let lbad = app.lat_bad_ms();
-    let lc = if cur > lbad {
-        BAD
-    } else if cur > lwarn {
-        WARN
-    } else {
-        OK
+    let lc = match cur {
+        Some(v) if v > lbad => BAD,
+        Some(v) if v > lwarn => WARN,
+        _ => OK,
     };
     let title = format!(
-        "Latency  pooled  cur {:.1} ms   avg {:.1}   min {:.1}   max {:.1}   (median of {} targets)",
-        cur, stat.avg().unwrap_or(0.0), stat.min, stat.max, app.primaries.len(),
+        "Latency  pooled  cur {}   avg {:.1}   min {:.1}   max {:.1}   (median of {} targets)",
+        cur.map(|v| format!("{:.1} ms", v))
+            .unwrap_or_else(|| "—".into()),
+        stat.avg().unwrap_or(0.0),
+        stat.min,
+        stat.max,
+        app.primaries.len(),
     );
 
     let show_warn = lwarn <= y_max;
@@ -283,6 +307,10 @@ fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
+    let run_data: Vec<Vec<(f64, f64)>> = runs
+        .into_iter()
+        .map(|r| r.into_iter().map(|(i, v)| (i as f64, v)).collect())
+        .collect();
     let mut datasets: Vec<Dataset> = Vec::new();
     if show_warn {
         datasets.push(
@@ -294,14 +322,16 @@ fn draw_latency(f: &mut Frame, app: &App, area: Rect) {
                 .data(&warn_pts),
         );
     }
-    datasets.push(
-        Dataset::default()
-            .name("pooled RTT")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(lc))
-            .data(&points),
-    );
+    for (i, run) in run_data.iter().enumerate() {
+        datasets.push(
+            Dataset::default()
+                .name(if i == 0 { "pooled RTT" } else { "" })
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(lc))
+                .data(run),
+        );
+    }
     let chart = Chart::new(datasets)
         .block(header_block(&title))
         .x_axis(
@@ -371,14 +401,13 @@ fn draw_loss(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_jitter(f: &mut Frame, app: &App, area: Rect) {
-    let samples: Vec<f64> = app.jit_hist.as_vec();
+    let samples: Vec<Option<f64>> = app.jit_hist.as_vec();
+    let runs = segment_runs(&samples);
     let ring_len = samples.len();
-    let points: Vec<(f64, f64)> = samples
+    let data_max = runs
         .iter()
-        .enumerate()
-        .map(|(i, v)| (i as f64, *v))
-        .collect();
-    let data_max = samples.iter().fold(0.0_f64, |a, &b| a.max(b));
+        .flat_map(|r| r.iter().map(|(_, y)| *y))
+        .fold(0.0_f64, f64::max);
     let mut y_max = data_max * 1.3;
     let warn_floor = app.jit_warn_ms() * 0.5;
     if y_max < warn_floor {
@@ -388,23 +417,20 @@ fn draw_jitter(f: &mut Frame, app: &App, area: Rect) {
 
     let jwarn = app.jit_warn_ms();
     let jcur = app.jitter_view();
-    let lc = if jcur > jwarn * 2.0 {
-        BAD
-    } else if jcur > jwarn {
-        WARN
-    } else {
-        OK
+    let lc = match jcur {
+        Some(v) if v > jwarn * 2.0 => BAD,
+        Some(v) if v > jwarn => WARN,
+        _ => OK,
     };
-    let verdict = if jcur > jwarn * 2.0 {
-        "  ⚠ HIGH"
-    } else if jcur > jwarn {
-        "  ◐ elevated"
-    } else {
-        ""
+    let verdict = match jcur {
+        Some(v) if v > jwarn * 2.0 => "  ⚠ HIGH",
+        Some(v) if v > jwarn => "  ◐ elevated",
+        _ => "",
     };
     let title = format!(
-        "Jitter  pooled  cur {:.1} ms  (median of {} targets){}",
-        jcur,
+        "Jitter  pooled  cur {} ms  (median of {} targets){}",
+        jcur.map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "—".into()),
         app.primaries.len(),
         verdict,
     );
@@ -415,6 +441,10 @@ fn draw_jitter(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Vec::new()
     };
+    let run_data: Vec<Vec<(f64, f64)>> = runs
+        .into_iter()
+        .map(|r| r.into_iter().map(|(i, v)| (i as f64, v)).collect())
+        .collect();
     let mut datasets: Vec<Dataset> = Vec::new();
     if show_warn {
         datasets.push(
@@ -426,14 +456,16 @@ fn draw_jitter(f: &mut Frame, app: &App, area: Rect) {
                 .data(&warn_pts),
         );
     }
-    datasets.push(
-        Dataset::default()
-            .name("pooled jitter")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(Style::default().fg(lc))
-            .data(&points),
-    );
+    for (i, run) in run_data.iter().enumerate() {
+        datasets.push(
+            Dataset::default()
+                .name(if i == 0 { "pooled jitter" } else { "" })
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::default().fg(lc))
+                .data(run),
+        );
+    }
     let chart = Chart::new(datasets)
         .block(header_block(&title))
         .x_axis(
@@ -688,14 +720,6 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 OK
             };
-            let hold = match p.recover_at {
-                Some(t) => {
-                    let elapsed = t.elapsed().as_secs();
-                    let remain = app.cfg.recover_dwell.as_secs().saturating_sub(elapsed);
-                    format!("recover in {}s", remain)
-                }
-                None => String::new(),
-            };
             Row::new(vec![
                 Cell::from(Span::styled(
                     format!(" {}  {:<6}", dot, p.label),
@@ -712,7 +736,6 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
                     format!("loss {:>5.1}%  {}/{}", lpct, p.lost, p.total),
                     Style::default().fg(lc),
                 )),
-                Cell::from(Span::styled(hold, Style::default().fg(MUTED))),
             ])
         })
         .collect();
@@ -722,7 +745,6 @@ fn draw_targets(f: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(14),
         Constraint::Length(14),
         Constraint::Length(10),
-        Constraint::Length(20),
         Constraint::Min(15),
     ];
     let title = format!("Targets  {} consensus members", app.primaries.len());
@@ -922,6 +944,15 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             format!("{}", app.outages),
             Style::default().fg(if app.outages > 0 { BAD } else { OK }),
+        ),
+        Span::raw("   "),
+        Span::styled("recovery ", Style::default().fg(MUTED)),
+        Span::styled(
+            match app.recovery_remaining(std::time::Instant::now()) {
+                Some(remain) => format!("{}s", remain.as_secs()),
+                None => "—".to_string(),
+            },
+            Style::default().fg(WARN),
         ),
     ]));
 

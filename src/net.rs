@@ -7,6 +7,7 @@ pub struct PingSample {
     pub rtt_ms: Option<f64>,
 }
 
+#[derive(Clone)]
 pub struct TcpPinger {
     pub addr: String,
     pub port: u16,

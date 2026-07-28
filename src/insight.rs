@@ -141,9 +141,6 @@ fn isp_outage(app: &App) -> Option<Insight> {
         return None;
     }
     let mut ev = format!("{}/{} targets lost", down_count(app), app.primaries.len());
-    if app.extras.iter().any(|e| e.state == LinkState::Up) {
-        ev.push_str(" · LAN OK");
-    }
     if let (Some(r), Some(g)) = (app.wifi_rssi, app.wifi_grade) {
         ev.push_str(&format!(" · wifi {} ({} dBm)", rssi_verdict_grade(g), r));
     }
@@ -249,7 +246,7 @@ fn jitter_high(app: &App) -> Option<Insight> {
     if app.state == LinkState::Down {
         return None;
     }
-    let jit = app.jitter_view();
+    let jit = app.jitter_view()?;
     let warn = app.jit_warn_ms();
     if jit <= warn {
         return None;
@@ -426,6 +423,7 @@ mod tests {
             lost: 0,
             ring: Ring::new(30),
             consec_loss: 0,
+            last_sample_at: None,
         });
     }
 
@@ -462,7 +460,10 @@ mod tests {
         add_extra(&mut a, LinkState::Up);
         let out = diagnose(&a);
         assert!(out[0].cause.contains("upstream outage"));
-        assert!(out[0].evidence.contains("LAN OK"));
+        assert!(
+            !out[0].evidence.contains("LAN OK"),
+            "LAN OK overclaim removed"
+        );
     }
 
     #[test]
@@ -515,7 +516,7 @@ mod tests {
     fn jitter_high_detected() {
         let mut a = base_app();
         for p in a.primaries.iter_mut() {
-            p.jitter_ring.push(100.0);
+            p.jitter_ring.push(Some(100.0));
             p.last_value = Some(20.0);
         }
         let out = diagnose(&a);
@@ -599,7 +600,7 @@ mod tests {
             c.last = None;
         }
         for p in a.primaries.iter_mut() {
-            p.jitter_ring.push(100.0);
+            p.jitter_ring.push(Some(100.0));
             p.last_value = Some(300.0);
         }
         let out = diagnose(&a);
@@ -607,5 +608,17 @@ mod tests {
         assert!(out[0].cause.contains("system DNS"));
         assert!(out[1].cause.contains("jitter"));
         assert!(out[2].cause.contains("latency elevated"));
+    }
+
+    #[test]
+    fn jitter_high_skips_when_none() {
+        let mut a = base_app();
+        a.state = LinkState::Degraded;
+        // All jitter rings empty → jitter_view() returns None.
+        let out = diagnose(&a);
+        assert!(
+            !out.iter().any(|i| i.cause.contains("jitter")),
+            "jitter insight should not appear when jitter_view is None"
+        );
     }
 }
