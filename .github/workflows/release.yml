@@ -59,7 +59,7 @@ jobs:
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ env.BINARY }}.exe" -DestinationPath "${{ env.BINARY }}-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.BINARY }}-${{ matrix.target }}
           path: |
