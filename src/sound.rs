@@ -301,7 +301,7 @@ pub fn spawn_sound(
         None
     };
     #[cfg(target_os = "linux")]
-    let pc_speaker = if wants_pc_speaker {
+    let mut pc_speaker = if wants_pc_speaker {
         pc_speaker::Device::open(pc_speaker_device.as_deref().unwrap_or_else(|| {
             std::path::Path::new("/dev/input/by-path/platform-pcspkr-event-spkr")
         }))
