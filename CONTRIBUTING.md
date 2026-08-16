@@ -67,3 +67,9 @@ By contributing you agree that your changes are licensed under the MIT license, 
 ## Audio and code assets
 
 Any future audio or code asset incorporated into this project must record source, version, author, and license before merging. This applies to sound files, synthesis code borrowed from other projects, and any third-party code beyond standard dependencies.
+
+## Portability and licensing
+
+Keep monitoring, state-reduction, evidence, and persistence logic platform-neutral. Platform-specific behavior belongs behind a capability-detected adapter and must degrade safely when the capability is absent. Tests should use fixtures or fakes rather than a contributor's hardware, addresses, filesystem layout, or private network.
+
+Do not add host-specific IP addresses, device names, virtualization identifiers, or deployment assumptions to source, tests, comments, examples, or commit messages. New dependencies and copied code must be compatible with the MIT license and have their source and license documented before inclusion. Platform-only integration tests must be explicitly guarded and must not be required for the portable test suite.

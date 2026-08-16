@@ -31,6 +31,76 @@ pub enum SoundEvent {
     ProbeAnomaly,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tone {
+    pub frequency_hz: u32,
+    pub duration_ms: u64,
+    pub gap_ms: u64,
+}
+
+#[allow(dead_code)]
+pub fn pc_speaker_pattern(event: SoundEvent) -> Vec<Tone> {
+    match event {
+        SoundEvent::Loss => vec![
+            Tone {
+                frequency_hz: 660,
+                duration_ms: 120,
+                gap_ms: 30,
+            },
+            Tone {
+                frequency_hz: 440,
+                duration_ms: 180,
+                gap_ms: 30,
+            },
+        ],
+        SoundEvent::Down => vec![
+            Tone {
+                frequency_hz: 330,
+                duration_ms: 140,
+                gap_ms: 60,
+            },
+            Tone {
+                frequency_hz: 330,
+                duration_ms: 140,
+                gap_ms: 60,
+            },
+            Tone {
+                frequency_hz: 330,
+                duration_ms: 180,
+                gap_ms: 40,
+            },
+        ],
+        SoundEvent::Recover => vec![
+            Tone {
+                frequency_hz: 523,
+                duration_ms: 120,
+                gap_ms: 30,
+            },
+            Tone {
+                frequency_hz: 659,
+                duration_ms: 120,
+                gap_ms: 30,
+            },
+            Tone {
+                frequency_hz: 784,
+                duration_ms: 180,
+                gap_ms: 40,
+            },
+        ],
+        SoundEvent::Shimmer => vec![Tone {
+            frequency_hz: 880,
+            duration_ms: 100,
+            gap_ms: 30,
+        }],
+        SoundEvent::ProbeAnomaly => vec![Tone {
+            frequency_hz: 1175,
+            duration_ms: 100,
+            gap_ms: 30,
+        }],
+    }
+}
+
 #[derive(Clone)]
 pub struct NoteSpec {
     pub freq: f64,
@@ -203,30 +273,169 @@ pub fn chime_probe_anomaly() -> impl Source<Item = f32> {
     n1.mix(n2)
 }
 
-pub fn spawn_audio() -> Option<(mpsc::UnboundedSender<SoundEvent>, Arc<AudioState>)> {
-    use rodio::{OutputStream, Sink};
-    let (stream, handle) = OutputStream::try_default().ok()?;
-    std::mem::forget(stream);
+pub fn spawn_sound(
+    backend: crate::config::SoundBackend,
+    pc_speaker_device: Option<std::path::PathBuf>,
+) -> Option<(mpsc::UnboundedSender<SoundEvent>, Arc<AudioState>)> {
+    if backend == crate::config::SoundBackend::Off {
+        return None;
+    }
+    let wants_audio = matches!(
+        backend,
+        crate::config::SoundBackend::Audio | crate::config::SoundBackend::Both
+    );
+    #[cfg(target_os = "linux")]
+    let wants_pc_speaker = matches!(
+        backend,
+        crate::config::SoundBackend::PcSpeaker | crate::config::SoundBackend::Both
+    );
+    #[cfg(not(target_os = "linux"))]
+    let wants_pc_speaker = false;
+    #[cfg(not(target_os = "linux"))]
+    let _ = wants_pc_speaker;
+
+    let audio = if wants_audio {
+        use rodio::OutputStream;
+        OutputStream::try_default().ok()
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let pc_speaker = if wants_pc_speaker {
+        pc_speaker::Device::open(pc_speaker_device.as_deref().unwrap_or_else(|| {
+            std::path::Path::new("/dev/input/by-path/platform-pcspkr-event-spkr")
+        }))
+        .ok()
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let pc_speaker: Option<()> = {
+        let _ = pc_speaker_device;
+        None
+    };
+
+    if audio.is_none() && pc_speaker.is_none() {
+        return None;
+    }
 
     let state = Arc::new(AudioState::default());
-
     let (tx, mut rx) = mpsc::unbounded_channel::<SoundEvent>();
-    let _h = Arc::clone(&state);
+    let audio_handle = audio.map(|(stream, handle)| {
+        std::mem::forget(stream);
+        handle
+    });
     tokio::task::spawn_blocking(move || {
         while let Some(ev) = rx.blocking_recv() {
-            let sink = match Sink::try_new(&handle) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            match ev {
-                SoundEvent::Recover => sink.append(chime_recover()),
-                SoundEvent::Loss => sink.append(chime_loss()),
-                SoundEvent::Down => sink.append(chime_down()),
-                SoundEvent::Shimmer => sink.append(chime_shimmer()),
-                SoundEvent::ProbeAnomaly => sink.append(chime_probe_anomaly()),
+            if let Some(ref handle) = audio_handle {
+                use rodio::Sink;
+                if let Ok(sink) = Sink::try_new(handle) {
+                    match ev {
+                        SoundEvent::Recover => sink.append(chime_recover()),
+                        SoundEvent::Loss => sink.append(chime_loss()),
+                        SoundEvent::Down => sink.append(chime_down()),
+                        SoundEvent::Shimmer => sink.append(chime_shimmer()),
+                        SoundEvent::ProbeAnomaly => sink.append(chime_probe_anomaly()),
+                    }
+                    sink.detach();
+                }
             }
-            sink.detach();
+            #[cfg(target_os = "linux")]
+            if let Some(ref mut device) = pc_speaker {
+                let _ = device.play(&pc_speaker_pattern(ev));
+            }
         }
     });
     Some((tx, state))
+}
+
+#[cfg(target_os = "linux")]
+mod pc_speaker {
+    use std::fs::OpenOptions;
+    use std::io::{self, Write};
+    use std::mem::size_of;
+    use std::path::Path;
+    use std::thread;
+    use std::time::Duration;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct InputEvent {
+        pub tv_sec: libc::time_t,
+        pub tv_usec: libc::suseconds_t,
+        pub event_type: u16,
+        pub code: u16,
+        pub value: i32,
+    }
+
+    pub fn encode_event(value: i32) -> Vec<u8> {
+        let event = InputEvent {
+            tv_sec: 0,
+            tv_usec: 0,
+            event_type: 0x12,
+            code: 0x02,
+            value,
+        };
+        unsafe {
+            std::slice::from_raw_parts(
+                (&event as *const InputEvent).cast::<u8>(),
+                size_of::<InputEvent>(),
+            )
+            .to_vec()
+        }
+    }
+
+    pub struct Device {
+        file: std::fs::File,
+    }
+
+    impl Device {
+        pub fn open(path: &Path) -> io::Result<Self> {
+            let file = OpenOptions::new().write(true).open(path)?;
+            Ok(Self { file })
+        }
+
+        pub fn play(&mut self, pattern: &[super::Tone]) -> io::Result<()> {
+            for tone in pattern {
+                self.file
+                    .write_all(&encode_event(tone.frequency_hz as i32))?;
+                thread::sleep(Duration::from_millis(tone.duration_ms));
+                self.file.write_all(&encode_event(0))?;
+                thread::sleep(Duration::from_millis(tone.gap_ms));
+            }
+            self.file.flush()
+        }
+    }
+}
+
+#[cfg(test)]
+mod pattern_tests {
+    use super::*;
+
+    #[test]
+    fn outage_pattern_is_serializable_and_monophonic() {
+        let pattern = pc_speaker_pattern(SoundEvent::Down);
+        assert_eq!(pattern.len(), 3);
+        assert!(pattern.iter().all(|tone| tone.frequency_hz > 0));
+        assert!(pattern.iter().all(|tone| tone.duration_ms > 0));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg(test)]
+mod pc_speaker_tests {
+    #[test]
+    fn tone_event_contains_linux_sound_code_and_frequency() {
+        let bytes = super::pc_speaker::encode_event(880);
+        assert_eq!(
+            bytes.len(),
+            std::mem::size_of::<super::pc_speaker::InputEvent>()
+        );
+        let event = unsafe {
+            std::ptr::read_unaligned(bytes.as_ptr() as *const super::pc_speaker::InputEvent)
+        };
+        assert_eq!(event.event_type, 0x12);
+        assert_eq!(event.code, 0x02);
+        assert_eq!(event.value, 880);
+    }
 }
