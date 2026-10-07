@@ -1,0 +1,52 @@
+[Unit]
+Description=ping_monitor 24x7 local network monitor
+Documentation=https://github.com/clasanch/ping_monitor
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ping-monitor
+Group=ping-monitor
+EnvironmentFile=-/etc/ping-monitor/ping-monitor.env
+WorkingDirectory=/var/lib/ping-monitor
+ExecStart=/usr/local/bin/ping_monitor --headless
+
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+StateDirectory=ping-monitor
+LogsDirectory=ping-monitor
+UMask=0027
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/ping-monitor /var/log/ping-monitor
+
+# Keep device visibility enabled so an administrator can opt into the
+# capability-gated Linux PC-speaker backend. File permissions still control
+# access to the selected device; the service never runs as root.
+PrivateDevices=false
+
+MemoryMax=128M
+TasksMax=32
+LimitNOFILE=4096
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ping-monitor
+
+[Install]
+WantedBy=multi-user.target

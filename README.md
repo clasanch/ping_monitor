@@ -24,7 +24,10 @@ Other monitors alert through the network. An outage notifier that needs the netw
 - **Connection recovery** — stepwise recovery through Degraded (one 15s dwell per step). A noisy minority target does not reset recovery while a strict recovering majority remains.
 - **Optional isolated-target cue** — one quiet, rate-limited sound when exactly one target degrades while the connection stays Up. Enable with `PM_PREALERT=1`.
 - **Session summaries** — uptime %, MTTR, outages/recoveries counters, top-3 latency and jitter spikes with unix timestamps. Auto-exported as TSV on every state transition.
-- **Hardware-accurate audio** — pitched chimes generated via `rodio` synth (E6 shimmer for degraded, ADSR chord for down/recover), fading on transitions only. Mute with `m` cuts everything.
+- **Durable incident evidence** — headless mode writes transition-only `START`, `TRACE`, and `END` TSV records with timestamps, duration, metrics, gateway evidence, and raw trace output.
+- **Headless service mode** — `--headless` runs without a terminal, desktop notifications, or an audio device and supports systemd deployment.
+- **Automatic path diagnosis** — one bounded route trace is collected when a confirmed outage begins; filtering and rate-limiting are reported as uncertainty, not router certainty.
+- **Optional local sound backends** — generated `rodio` audio and a capability-gated Linux PC-speaker backend can be selected independently. Missing hardware never stops monitoring.
 - **Clean TUI** — `ratatui` 256-color, pooled charts with gap-free rendering, heatmap history, sparkline loss.
 
 ## Install
@@ -58,6 +61,11 @@ PM_TIMEOUT_MS=1500
 PM_REMINDER_S=30
 PM_PREALERT=1
 PM_RECURSIVE_MODE=legacy
+PM_MODE=headless
+PM_LOG_DIR=/var/log/ping-monitor
+PM_STATE_DIR=/var/lib/ping-monitor
+PM_AUTO_TRACE=1
+PM_SOUND_BACKEND=off
 ```
 
 Internals clamp everything to safe ranges on startup; you can't break it with bad env values.
@@ -66,7 +74,13 @@ Internals clamp everything to safe ranges on startup; you can't break it with ba
 
 `PM_PREALERT=1` enables an isolated-target anomaly cue (off by default). When exactly one target degrades while the connection stays Up, a quiet rate-limited sound plays. Global cooldown: 60 seconds.
 
-`PM_RECURSIVE_MODE` selects the recursive detector mode: `legacy` (default, existing classifier only), `shadow` (compute recursive latches for diagnostics without affecting state), or `hybrid` (recursive latches may produce Degraded alongside legacy). Changing the default to `hybrid` requires a separate decision after shadow validation.
+`PM_RECURSIVE_MODE` selects the recursive detector mode: `legacy` (default), `shadow` (diagnostics only), or `hybrid` (recursive latches may produce Degraded alongside the legacy classifier).
+
+`PM_MODE=headless` is equivalent to `--headless`. `--check-config` validates configuration and exits without starting probes. Headless mode writes incident records under `PM_LOG_DIR` and its atomic restart checkpoint under `PM_STATE_DIR`.
+
+`PM_SOUND_BACKEND` accepts `off`, `audio`, `pc-speaker`, or `both`. The PC-speaker backend is Linux-only and is detected at runtime; it is never required for monitoring.
+
+See `contrib/systemd/README.md` for generic service installation and `contrib/proxmox/README.md` for virtualization notes.
 
 ## Layout
 
@@ -83,10 +97,10 @@ Internals clamp everything to safe ranges on startup; you can't break it with ba
 ## Tests
 
 ```
-cargo test
+cargo test --all-targets
 ```
 
-132 tests covering config validation, strict-majority consensus (all 3^n combinations for n=1..5), target/connection state reducers, true-pause recovery, round-based batch protocol, optional jitter, independent baseline counts, recursive detector equations and warmup, gateway evidence freshness, PathCause, isolated-target cue, and every insight rule.
+193 tests covering config validation, strict-majority consensus (all 3^n combinations for n=1..5), target/connection state reducers, true-pause recovery, round-based batch protocol, transition-only events, incident persistence, restart checkpoints, bounded trace parsing, optional jitter, independent baseline counts, recursive detector equations and warmup, gateway evidence freshness, PathCause, isolated-target cue, and every insight rule.
 
 ## Screenshots
 

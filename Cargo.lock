@@ -1629,6 +1629,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "hickory-resolver",
+ "libc",
  "ratatui",
  "rodio",
  "tokio",

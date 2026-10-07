@@ -1,4 +1,5 @@
 use crate::detector::EwmaDetector;
+use crate::incident::Evidence;
 use crate::sound::SoundEvent;
 use crate::state::{consensus, reduce_connection, reduce_target, DesiredState, RecoveryState};
 use std::collections::VecDeque;
@@ -416,6 +417,16 @@ fn cause_word(cause: PathCause) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TransitionEffect {
+    pub from: LinkState,
+    pub to: LinkState,
+    pub at: std::time::SystemTime,
+    pub duration_ms: u64,
+    pub cause: PathCause,
+    pub evidence: Evidence,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetectorMode {
     Legacy,
@@ -510,6 +521,7 @@ pub struct App {
     pub probe_anomaly_edge: Vec<bool>,
     pub probe_anomaly_cooldown_at: Option<Instant>,
     pub pending_cause_log_idx: Option<usize>,
+    last_transition: Option<TransitionEffect>,
 }
 
 #[derive(Clone, Debug)]
@@ -734,6 +746,7 @@ impl App {
             probe_anomaly_edge: Vec::new(),
             probe_anomaly_cooldown_at: None,
             pending_cause_log_idx: None,
+            last_transition: None,
         }
     }
 
@@ -948,7 +961,106 @@ impl App {
         self.probe_anomaly_edge.clear();
         self.probe_anomaly_cooldown_at = None;
         self.pending_cause_log_idx = None;
+        self.last_transition = None;
         self.log(Level::Info, "stats reset");
+    }
+
+    pub fn take_transition_effect(&mut self) -> Option<TransitionEffect> {
+        self.last_transition.take()
+    }
+
+    pub fn evidence_snapshot(&self) -> Evidence {
+        let dns_state = self
+            .dns
+            .cells
+            .iter()
+            .flat_map(|row| row.iter())
+            .map(|cell| cell.state)
+            .max_by_key(|state| match state {
+                LinkState::Up => 0,
+                LinkState::Degraded => 1,
+                LinkState::Down => 2,
+            })
+            .map(|state| match state {
+                LinkState::Up => "up",
+                LinkState::Degraded => "degraded",
+                LinkState::Down => "down",
+            })
+            .map(str::to_string);
+        let gateway_state = match self.gw_role {
+            GatewayRole::UserExtra(i) | GatewayRole::AutoExtra(i) => {
+                self.extras.get(i).map(|extra| {
+                    match extra.state {
+                        LinkState::Up => "up",
+                        LinkState::Degraded => "degraded",
+                        LinkState::Down => "down",
+                    }
+                    .to_string()
+                })
+            }
+            GatewayRole::Unknown => None,
+        };
+        Evidence {
+            state: match self.state {
+                LinkState::Up => "up",
+                LinkState::Degraded => "degraded",
+                LinkState::Down => "down",
+            }
+            .to_string(),
+            packet_loss_pct: Some(self.recent_loss_pct()),
+            latest_rtt_ms: self.last_value_view(),
+            average_rtt_ms: self.recent_average_rtt_ms(),
+            jitter_ms: self.jitter_view(),
+            dns_state,
+            gateway_state,
+        }
+    }
+
+    /// Evidence uses the same recent observation window that drives target
+    /// classification, not the lifetime session counters.
+    fn evidence_window(&self) -> usize {
+        self.cfg.state_window.clamp(1, WIN)
+    }
+
+    fn recent_loss_pct(&self) -> f64 {
+        let window = self.evidence_window();
+        let mut total = 0_u64;
+        let mut lost = 0_u64;
+        for probe in &self.primaries {
+            for value in probe.loss_ring.buf.iter().rev().take(window) {
+                total += 1;
+                if *value > 0.0 {
+                    lost += 1;
+                }
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            lost as f64 * 100.0 / total as f64
+        }
+    }
+
+    fn recent_average_rtt_ms(&self) -> Option<f64> {
+        let window = self.evidence_window();
+        let mut count = 0_u64;
+        let mut sum = 0.0;
+        for probe in &self.primaries {
+            for value in probe.lat_ring.buf.iter().rev().take(window).flatten() {
+                count += 1;
+                sum += *value;
+            }
+        }
+        (count > 0).then_some(sum / count as f64)
+    }
+
+    pub fn gateway_host(&self) -> Option<String> {
+        match self.gw_role {
+            GatewayRole::UserExtra(i) | GatewayRole::AutoExtra(i) => {
+                self.extras.get(i).map(|extra| extra.host.clone())
+            }
+            GatewayRole::Unknown => None,
+        }
     }
 
     pub fn ingest_extra(&mut self, idx: usize, sample: crate::net::PingSample) {
@@ -1424,6 +1536,7 @@ impl App {
         batch: PrimaryBatch,
         now: Instant,
     ) -> Option<SoundEvent> {
+        self.last_transition = None;
         // Stale batch rejection
         if batch.reset_epoch != self.reset_epoch.load(Ordering::Acquire) {
             return None;
@@ -1470,6 +1583,7 @@ impl App {
         let states: Vec<LinkState> = self.primaries.iter().map(|p| p.state).collect();
         let desired = consensus(&states);
         let prev = self.state;
+        let transition_duration_ms = now.duration_since(self.state_since).as_millis() as u64;
 
         let new_state = reduce_connection(
             self.state,
@@ -1492,6 +1606,7 @@ impl App {
         }
 
         let mut sound: Option<SoundEvent> = None;
+        let mut transition_cause = PathCause::Unknown;
 
         if prev != self.state {
             if prev == LinkState::Up {
@@ -1552,6 +1667,7 @@ impl App {
                 LinkState::Degraded => {
                     if prev == LinkState::Up {
                         let cause = self.path_cause(desired, now);
+                        transition_cause = cause;
                         self.log(
                             Level::Warn,
                             format!(
@@ -1574,6 +1690,7 @@ impl App {
                 }
                 LinkState::Down => {
                     let cause = self.path_cause(desired, now);
+                    transition_cause = cause;
                     self.log(
                         Level::Bad,
                         format!(
@@ -1590,7 +1707,14 @@ impl App {
                 }
             }
             self.last_reminder = Some(now);
-            let _ = self.export_tsv();
+            self.last_transition = Some(TransitionEffect {
+                from: prev,
+                to: self.state,
+                at: std::time::SystemTime::now(),
+                duration_ms: transition_duration_ms,
+                cause: transition_cause,
+                evidence: self.evidence_snapshot(),
+            });
         }
 
         let ms = match self.state {
@@ -1829,31 +1953,38 @@ impl App {
         let dns_warn = self.dns_warn_ms();
         let dns_bad = self.dns_bad_ms();
         let cell = &mut self.dns.cells[r_idx][d_idx];
+        let previous_state = cell.state;
         cell.ring.push(ms);
         cell.last = ms;
-        match ms {
+        let next_state = match ms {
             Some(v) => {
                 cell.stat.add(v);
                 if v > dns_bad {
-                    cell.state = LinkState::Down;
-                    self.log(
-                        Level::Bad,
-                        format!("[DNS {}→{}] slow: {:.0} ms", r_label, d_name, v),
-                    );
+                    LinkState::Down
                 } else if v > dns_warn {
-                    cell.state = LinkState::Degraded;
-                    self.log(
-                        Level::Warn,
-                        format!("[DNS {}→{}] high: {:.0} ms", r_label, d_name, v),
-                    );
+                    LinkState::Degraded
                 } else {
-                    cell.state = LinkState::Up;
+                    LinkState::Up
                 }
             }
-            None => {
-                cell.state = LinkState::Down;
-                self.log(Level::Bad, format!("[DNS {}→{}] failed", r_label, d_name));
-            }
+            None => LinkState::Down,
+        };
+        cell.state = next_state;
+        if previous_state != next_state {
+            let level = match next_state {
+                LinkState::Up => Level::Good,
+                LinkState::Degraded => Level::Warn,
+                LinkState::Down => Level::Bad,
+            };
+            let state_word = match next_state {
+                LinkState::Up => "up",
+                LinkState::Degraded => "degraded",
+                LinkState::Down => "down",
+            };
+            self.log(
+                level,
+                format!("[DNS {}→{}] {}", r_label, d_name, state_word),
+            );
         }
         None
     }
@@ -2049,6 +2180,31 @@ mod tests {
     }
 
     #[test]
+    fn evidence_snapshot_uses_recent_window_not_session_totals() {
+        let mut a = app_with_n_probes(1);
+        a.cfg.state_window = 5;
+        let probe = &mut a.primaries[0];
+
+        for _ in 0..100 {
+            probe.total += 1;
+            probe.lost += 1;
+            probe.lat_ring.push(None);
+            probe.loss_ring.push(1.0);
+            probe.stat.add(1_000.0);
+        }
+        for _ in 0..5 {
+            probe.total += 1;
+            probe.lat_ring.push(Some(20.0));
+            probe.loss_ring.push(0.0);
+            probe.stat.add(20.0);
+        }
+
+        let evidence = a.evidence_snapshot();
+        assert_eq!(evidence.packet_loss_pct, Some(0.0));
+        assert_eq!(evidence.average_rtt_ms, Some(20.0));
+    }
+
+    #[test]
     fn config_clamps_invalid_values() {
         let mut cfg = Config {
             timeout_ms: 0,
@@ -2123,6 +2279,101 @@ mod tests {
             "factual state, got '{}'",
             msg
         );
+    }
+
+    #[test]
+    fn continuous_dns_failure_emits_one_transition_event() {
+        let mut a = app_with_n_probes(1);
+        a.ingest_dns(0, 0, None);
+        let after_start = a.events.len();
+        a.ingest_dns(0, 0, None);
+        a.ingest_dns(0, 0, None);
+        assert_eq!(
+            a.events.len(),
+            after_start,
+            "a continuous DNS failure must not emit repeated events"
+        );
+    }
+
+    #[test]
+    fn continuous_extra_failure_emits_only_start_and_recovery() {
+        let mut a = app_with_n_probes(1);
+        a.extras.push(ExtraProbe {
+            label: "extra".into(),
+            host: "example.invalid".into(),
+            port: 443,
+            last: None,
+            state: LinkState::Up,
+            total: 0,
+            lost: 0,
+            consec_loss: 0,
+            ring: Ring::new(30),
+            last_sample_at: None,
+        });
+        a.ingest_extra(0, PingSample { rtt_ms: None });
+        let after_first_sample = a.events.len();
+        a.ingest_extra(0, PingSample { rtt_ms: None });
+        let after_start = a.events.len();
+        a.ingest_extra(0, PingSample { rtt_ms: None });
+        assert_eq!(
+            a.events.len(),
+            after_start,
+            "continuous extra failure must not emit repeated events"
+        );
+        a.ingest_extra(0, PingSample { rtt_ms: Some(10.0) });
+        assert_eq!(
+            a.events.len(),
+            after_start + 1,
+            "recovery must emit exactly one event"
+        );
+        assert_eq!(
+            after_start,
+            after_first_sample + 1,
+            "the initial isolated sample must not be logged as an incident"
+        );
+    }
+
+    #[test]
+    fn transition_effect_is_emitted_once_with_evidence() {
+        let mut a = app_with_n_probes(3);
+        for round in 0..25 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            a.ingest_generation_at(batch, Instant::now());
+            assert!(a.take_transition_effect().is_none());
+        }
+        let mut effect = None;
+        for round in 25..60 {
+            let batch = PrimaryBatch {
+                round_id: round,
+                reset_epoch: a.reset_epoch.load(Ordering::Acquire),
+                results: vec![
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: None }),
+                    RoundResult::Observed(PingSample { rtt_ms: Some(20.0) }),
+                ],
+                started_at: Instant::now(),
+            };
+            a.ingest_generation_at(batch, Instant::now());
+            if let Some(candidate) = a.take_transition_effect() {
+                effect = Some(candidate);
+                break;
+            }
+        }
+        let effect = effect.expect("degradation transition should be exposed");
+        assert_eq!(effect.from, LinkState::Up);
+        assert_eq!(effect.to, LinkState::Degraded);
+        assert_eq!(effect.evidence.state, "degraded");
+        assert!(effect.evidence.packet_loss_pct.is_some());
+        assert!(a.take_transition_effect().is_none());
     }
 
     #[test]

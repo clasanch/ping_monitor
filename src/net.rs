@@ -25,9 +25,16 @@ fn error_counts_as_alive(enabled: bool, kind: std::io::ErrorKind) -> bool {
         )
 }
 
+fn socket_target(addr: &str, port: u16) -> String {
+    match addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{addr}]:{port}"),
+        _ => format!("{addr}:{port}"),
+    }
+}
+
 impl TcpPinger {
     pub async fn ping(&self) -> PingSample {
-        let target = format!("{}:{}", self.addr, self.port);
+        let target = socket_target(&self.addr, self.port);
         let dur = Duration::from_millis(self.timeout_ms);
         let start = std::time::Instant::now();
         let res = timeout(dur, TcpStream::connect(&target)).await;
@@ -149,5 +156,11 @@ mod tests {
             true,
             std::io::ErrorKind::NetworkUnreachable
         ));
+    }
+
+    #[test]
+    fn formats_ipv6_targets_for_tcp_connect() {
+        assert_eq!(socket_target("2001:db8::1", 443), "[2001:db8::1]:443");
+        assert_eq!(socket_target("example.test", 443), "example.test:443");
     }
 }
