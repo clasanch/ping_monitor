@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "network-programming"]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util", "signal"] }
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = "0.29"
-rodio = { version = "0.20", default-features = false, features = ["flac", "vorbis"] }
+rodio = { version = "0.23", default-features = false, features = ["flac", "vorbis"] }
 hickory-resolver = "0.26"
 
 [target.'cfg(target_os = "linux")'.dependencies]
